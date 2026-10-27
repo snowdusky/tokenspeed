@@ -31,7 +31,6 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.grammar.capturable_grammar import (
         GrammarStepCompletion,
     )
-    from tokenspeed.runtime.utils.output_copy import CopyStreamCompletion
 
 
 @dataclass(frozen=True)
@@ -318,7 +317,7 @@ class ModelExecutionResult:
     """
 
     output_tokens: torch.Tensor
-    copy_event: torch.cuda.Event | CopyStreamCompletion | None = None
+    copy_event: torch.cuda.Event | None = None
     output_lengths: torch.Tensor | None = None
     grammar_completion: GrammarStepCompletion | None = None
     # Per-position logprob of the sampled token, same layout as output_tokens.

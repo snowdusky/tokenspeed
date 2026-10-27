@@ -23,7 +23,6 @@ from __future__ import annotations
 import gc
 import time
 from collections.abc import Mapping, Sequence
-from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
@@ -135,7 +134,6 @@ from tokenspeed.runtime.utils.common import maybe_inference_mode
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import get_context_length
 from tokenspeed.runtime.utils.nvtx import nvtx_range
-from tokenspeed.runtime.utils.output_copy import CopyStreamPool
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -789,11 +787,6 @@ class ModelExecutor:
         # themselves.
         self.default_stream = self.device_module.default_stream(self.device)
         self.execution_stream = self.device_module.Stream()
-        self._output_copy_pool = (
-            CopyStreamPool(self.device_module, self.device)
-            if torch.device(self.device).type == "npu"
-            else None
-        )
         # Throttles the mm_timing line inside execute_forward_op; the
         # per-round batch lines have their own counter on the control plane.
         self.log_step = 0
@@ -2601,18 +2594,7 @@ class ModelExecutor:
                     num_extends=num_extends,
                     output_layout=ctx.output_layout,
                 )
-            copy_completion = (
-                self._output_copy_pool.copy_after(
-                    self.execution_stream,
-                    (output_tokens, output_lengths, output_logprobs, forward_logprobs),
-                )
-                if self._output_copy_pool is not None
-                else None
-            )
-            with (
-                copy_completion if copy_completion is not None else nullcontext(),
-                nvtx_range("output_d2h", color="green"),
-            ):
+            with nvtx_range("output_d2h", color="green"):
                 output_d2h_start = time.perf_counter() if timing_enabled else 0.0
                 next_input_ids = None
                 spec_candidate_tokens = None
@@ -2672,11 +2654,8 @@ class ModelExecutor:
 
                 output_nan_flags = self.nan_guard.flags_cpu
 
-                if copy_completion is None:
-                    copy_event = self.device_module.Event()
-                    copy_event.record()
-                else:
-                    copy_event = copy_completion
+                copy_event = self.device_module.Event()
+                copy_event.record()
                 if timing_enabled:
                     output_d2h_ms = (time.perf_counter() - output_d2h_start) * 1000.0
 

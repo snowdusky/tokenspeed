@@ -82,6 +82,7 @@ def test_v41_eplb_loaded_slots_migration_and_graph(group):
     )
     from tokenspeed.runtime.models.deepseek_v41 import DeepseekV41MoE
     from tokenspeed.runtime.moe.eplb_algorithms import EplbAlgorithm
+    from tokenspeed.runtime.moe.expert_load_rows import ExpertLoadRowMask
     from tokenspeed.runtime.moe.expert_location import (
         ExpertLocationMetadata,
         get_global_expert_location_metadata,
@@ -106,7 +107,8 @@ def test_v41_eplb_loaded_slots_migration_and_graph(group):
             r // int(os.environ["LOCAL_WORLD_SIZE"]) for r in range(world)
         ),
     )
-    placement.enable_load_recording(mapping, all_to_all_ep=True)
+    placement.enable_load_recording(mapping)
+    placement.load_rows = ExpertLoadRowMask.for_all_to_all(mapping)
     placement.reserve_load_rows(16)
     quant = {
         "format": "int-quantized",

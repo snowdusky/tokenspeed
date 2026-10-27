@@ -3693,3 +3693,42 @@ def test_language_model_exposes_prepared_expert_slots(monkeypatch):
     for index, tensors in actual.items():
         assert all(left is right for left, right in zip(tensors, expected[index]))
     assert list(model._local_expert_ids(0)) == list(range(config.n_routed_experts // 4))
+
+
+@pytest.mark.parametrize(
+    "setting,value,message",
+    [
+        ("enable_eplb", True, "does not support EPLB"),
+        ("init_expert_location", "custom", "requires trivial expert placement"),
+        ("ep_num_redundant_experts", 2, "does not support redundant experts"),
+    ],
+)
+def test_non_ascend_moe_keeps_placement_restrictions(
+    monkeypatch, setting, value, message
+):
+    monkeypatch.setattr(v4, "get_moe_backend", lambda: MoeBackend.AUTO)
+    monkeypatch.setitem(global_server_args_dict, "enable_eplb", False)
+    monkeypatch.setitem(global_server_args_dict, "init_expert_location", "trivial")
+    monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
+    monkeypatch.setitem(global_server_args_dict, setting, value)
+    with torch.device("meta"), pytest.raises(ValueError, match=message):
+        v4.DeepseekV4MoE(_config(), _mapping(0, 4, 4), _quant(), 0, "ffn", None)
+
+
+@pytest.mark.skipif(
+    not current_platform().is_npu, reason="requires Ascend model planning"
+)
+def test_v41_mc2_binds_its_expert_communicator(monkeypatch):
+    from tokenspeed.runtime.layers.moe import utils as moe_utils
+
+    mapping = _mapping(0, 4, 4)
+    _mock_loader_hardware(monkeypatch, mapping)
+    monkeypatch.setattr(
+        moe_utils, "ALL2ALL_BACKEND", moe_utils.All2AllBackend.ASCEND_MC2
+    )
+    group = Mock(spec=torch.distributed.ProcessGroup)
+    monkeypatch.setattr(pg_manager, "get_dedicated_device_group", lambda *args: group)
+    with torch.device("meta"):
+        moe = v41.DeepseekV41MoE(_config(), mapping, _quant(), 0, "ffn", None)
+    assert moe.experts.plan["process_group"] is group
+    assert moe.owns_ep_communication

@@ -26,10 +26,7 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 if current_platform().is_npu:
-    from tokenspeed_kernel_npu import register_torch_compat
     from tokenspeed_kernel_npu.ops import dsv41_cache, dsv41_index, dsv41_metadata
-
-    register_torch_compat()
 
     @register_kernel(
         "attention",

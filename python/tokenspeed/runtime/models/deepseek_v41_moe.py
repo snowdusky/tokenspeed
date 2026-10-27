@@ -26,7 +26,7 @@ import torch
 from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32
 from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -127,7 +127,14 @@ class DeepseekV4MLP(nn.Module):
         if x.shape[0] == 0:
             return x.new_empty((0, self.down_proj.output_size))
         gate_up, _ = self.gate_up_proj(x)
-        out, _ = self.down_proj.forward_with_activation(gate_up, self.act_fn)
+        if gate_up.device.type == "npu" and gate_up.dtype == torch.bfloat16:
+            from tokenspeed_kernel.ops.activation import silu_and_mul
+
+            out, _ = self.down_proj(
+                silu_and_mul(gate_up, limit=self.act_fn.swiglu_limit)
+            )
+        else:
+            out, _ = self.down_proj.forward_with_activation(gate_up, self.act_fn)
         return out
 
 
@@ -294,11 +301,34 @@ class DeepseekV4MoE(nn.Module):
         # Petit's VMM-backed collective and auxiliary-stream shared experts do
         # not replay safely together. Keep both branches on the main stream.
         self.stream_fork = StreamFork(None if self.use_gluon_petit else aux_stream)
+        ascend_placement = (
+            current_platform().is_npu and moe_backend.value == "ascend_v41_w4a4"
+        )
+        if mapping.moe.ep_size > 1 and not ascend_placement:
+            if global_server_args_dict.get("enable_eplb", False):
+                raise ValueError(
+                    "DeepSeek V4 EP does not support EPLB with precomputed routing."
+                )
+            if global_server_args_dict.get("init_expert_location", "trivial") not in (
+                None,
+                "trivial",
+            ):
+                raise ValueError(
+                    "DeepSeek V4 EP requires trivial expert placement with "
+                    "precomputed routing."
+                )
+            if not self.use_mega_moe and global_server_args_dict.get(
+                "ep_num_redundant_experts", 0
+            ):
+                raise ValueError(
+                    "DeepSeek V4 normal EP does not support redundant experts "
+                    "with precomputed routing."
+                )
         self.expert_placement = get_global_expert_location_metadata()
         if self.expert_placement is not None:
             # The prepared slot ABI is currently provided by the Ascend W4A4
             # kernels. Other providers retain their existing placement limit.
-            if moe_backend.value != "ascend_v41_w4a4":
+            if not ascend_placement:
                 raise ValueError("V4.1 expert placement requires ascend_v41_w4a4")
             if self.expert_placement.num_logical_experts != config.n_routed_experts:
                 raise ValueError("V4.1 expert placement has the wrong logical geometry")

@@ -6,7 +6,8 @@ import torch
 
 from tokenspeed.runtime.distributed.comm_backend import hccl as hccl_module
 from tokenspeed.runtime.distributed.comm_backend import registry
-from tokenspeed.runtime.distributed.comm_backend.hccl import HcclBackend, HcclTpPolicy
+from tokenspeed.runtime.distributed.comm_backend.hccl import HcclBackend
+from tokenspeed.runtime.distributed.comm_backend.hccl_tp import HcclTpPolicy
 
 
 @pytest.mark.parametrize("size", [2, 4, 8])
@@ -183,7 +184,7 @@ def test_token_reduce_scatter_preserves_rows_and_skips_equal_shard_packing(
         # Simulate reduction of identical peer inputs, selecting this rank's chunk.
         output.copy_(input.chunk(len(counts))[current_rank] * len(counts))
 
-    monkeypatch.setattr(hccl_module.dist, "reduce_scatter_tensor", reduce_scatter)
+    monkeypatch.setattr(hccl_module.dist, "reduce_scatter_single", reduce_scatter)
     monkeypatch.setattr(hccl_module.dist, "get_rank", lambda: group[current_rank])
     for current_rank in range(len(counts)):
         output = backend.token_reduce_scatter(tensor, group, counts)
@@ -195,7 +196,7 @@ def test_token_reduce_scatter_preserves_rows_and_skips_equal_shard_packing(
 
 def test_single_rank_token_reduce_scatter_needs_no_collective(monkeypatch):
     reduce_scatter = Mock()
-    monkeypatch.setattr(hccl_module.dist, "reduce_scatter_tensor", reduce_scatter)
+    monkeypatch.setattr(hccl_module.dist, "reduce_scatter_single", reduce_scatter)
     tensor = torch.ones(8, 4)
     output = HcclBackend().token_reduce_scatter(tensor, (2,), [8])
     torch.testing.assert_close(output, tensor)

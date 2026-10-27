@@ -4,6 +4,12 @@ TokenSpeed-Kernel-NPU contains the Ascend-specific operators used by
 TokenSpeed. Keeping these implementations in a standalone package mirrors the
 AMD package layout and keeps the TokenSpeed runtime vendor-neutral.
 
+NPU platform initialization supplies missing `torch.distributed` names on the
+Torch 2.9 stack: `all_gather_single` aliases `all_gather_into_tensor`, and
+`reduce_scatter_single` aliases `reduce_scatter_tensor`. Existing implementations
+are preserved. These process-wide aliases retain arguments and asynchronous
+Work handles; they do not depend on loading a particular model or attention op.
+
 The initial Ascend path provides paged MHA, RMSNorm, Q/K RMSNorm, rotary
 embedding, and the Triton-Ascend import adapter required by CANN 9.0.0.
 

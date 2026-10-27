@@ -469,6 +469,9 @@ def _detect_platform() -> PlatformInfo:
 
 def _detect_npu_platform() -> PlatformInfo:
     """Detect an Ascend platform exposed through torch-npu."""
+    from tokenspeed_kernel_npu import register_torch_compat
+
+    register_torch_compat()
     props = torch.npu.get_device_properties(torch.npu.current_device())
     return PlatformInfo(
         vendor="ascend",

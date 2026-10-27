@@ -54,10 +54,6 @@ class SiluAndMul(torch.nn.Module):
             raise ValueError(
                 f"SwiGLU expects an even [gate, up] width, got {x.shape[-1]}"
             )
-        if x.device.type == "npu" and x.dtype == torch.bfloat16:
-            if fp8_out:
-                raise NotImplementedError("NPU fp8_out silu_and_mul is not implemented")
-            return silu_and_mul(x, limit=self.swiglu_limit)
         if not x.is_cuda:
             if fp8_out:
                 raise NotImplementedError("CPU fp8_out silu_and_mul is not implemented")

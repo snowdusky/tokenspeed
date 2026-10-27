@@ -645,7 +645,7 @@ class DeepseekV41RotaryEmbedding(nn.Module):
         self, x: torch.Tensor, positions: torch.Tensor, inverse: bool
     ) -> torch.Tensor:
         """Rotate only x's trailing RoPE dimensions at absolute token positions."""
-        if x.device.type == "cpu":
+        if x.device.type not in ("cuda", "npu"):
             angles = positions.clamp_min(0).float().unsqueeze(-1) * self.inv_freq
             freqs = torch.polar(torch.ones_like(angles), angles)
             if inverse:
@@ -666,7 +666,7 @@ class DeepseekV41RotaryEmbedding(nn.Module):
         self, x: torch.Tensor, positions: torch.Tensor, inverse: bool
     ) -> torch.Tensor:
         """Rotate a fresh projection/output in place; never pass shared latents before index K reads them."""
-        if x.device.type == "cpu":
+        if x.device.type not in ("cuda", "npu"):
             return self(x, positions, inverse)
         self._prepare_cache(x.device)
         cache = self.inverse_cos_sin_cache if inverse else self.cos_sin_cache
@@ -1447,6 +1447,11 @@ class DeepseekV41MoE(DeepseekV4MoE):
         super().__init__(
             expert_config, mapping, quant_config, layer_index, prefix, aux_stream
         )
+        if get_all2all_backend() is All2AllBackend.ASCEND_MC2:
+            # Bind MC2's private window before expert weight postprocessing.
+            self.experts.plan["process_group"] = pg_manager.get_dedicated_device_group(
+                mapping.moe.ep_group, "ascend_mc2"
+            )
         self.gate.register_parameter("bias_vl", None)
         if padded:
             self.config = config
@@ -1694,7 +1699,6 @@ class DeepseekV41DecoderLayer(nn.Module):
         image_mask,
         ctx,
         *,
-        token_mask: torch.Tensor | None = None,
         pending_post: V41HCPost | None,
         allow_ffn_reduce_fusion: bool,
         capture_input: bool,
@@ -1706,7 +1710,6 @@ class DeepseekV41DecoderLayer(nn.Module):
                 hidden_states[:, 0, :],
                 image_mask,
                 ctx,
-                token_mask=token_mask,
                 defer_reduce=False,
             )
             captured = hidden_states[:, 0, :] if capture_input else None
@@ -1728,7 +1731,6 @@ class DeepseekV41DecoderLayer(nn.Module):
                     x[:0],
                     None if image_mask is None else image_mask[:0],
                     ctx,
-                    token_mask=None if token_mask is None else token_mask[:0],
                     defer_reduce=False,
                 )
             return residual[:0], pre_mix[:0], None, captured
@@ -1823,8 +1825,6 @@ class DeepseekV41DecoderLayer(nn.Module):
             )
             if image_mask is not None:
                 image_mask = image_mask.index_select(0, rows.keep_rows)
-            if token_mask is not None:
-                token_mask = token_mask.index_select(0, rows.keep_rows)
         residual, x, ffn_mixes = _v41_hc_post_pre(
             residual,
             attn_pre,
@@ -1879,7 +1879,6 @@ class DeepseekV41DecoderLayer(nn.Module):
                 x,
                 image_mask,
                 ctx,
-                token_mask=token_mask,
                 defer_reduce=defer_moe,
             )
             ffn_pre, post, comb = ffn_mixes
@@ -1898,15 +1897,7 @@ class DeepseekV41DecoderLayer(nn.Module):
             captured,
         )
 
-    def _forward_ffn(
-        self,
-        x,
-        image_mask,
-        ctx,
-        *,
-        token_mask=None,
-        defer_reduce: bool,
-    ):
+    def _forward_ffn(self, x, image_mask, ctx, *, defer_reduce: bool):
         """MoE output after its communication.
 
         With defer_reduce, the pending plain all-reduce over the MoE TPxEP
@@ -1919,8 +1910,7 @@ class DeepseekV41DecoderLayer(nn.Module):
                 replicated_rows_moe,
             )
 
-            out = replicated_rows_moe(x, image_mask, ctx, self.ffn, self.comm_manager)
-            return out
+            return replicated_rows_moe(x, image_mask, ctx, self.ffn, self.comm_manager)
         if self.ffn.owns_ep_communication:
             if defer_reduce:
                 raise ValueError(
@@ -2324,7 +2314,6 @@ class DeepseekV41Model(nn.Module):
             state.positions,
             state.image_mask,
             ctx,
-            token_mask=state.engram_token_mask,
             pending_post=pending_post,
             # Stage handoffs and Engram require a complete HC stream. Admit
             # deferred reduction only when the next input can consume it fused.
@@ -2635,7 +2624,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
     """V4.1 language and vision model with strict checkpoint coverage."""
 
     model_cls = DeepseekV41Model
-    supports_expert_placement = True
+    supports_expert_placement = current_platform().is_npu
 
     def __init__(
         self,
@@ -2675,6 +2664,18 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                     )
             self.vision_embedder = VisionEmbedder(encoder_mapping=mapping.vision)
             self.image_encoder = self.vision.embed_media
+
+    def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
+        """Prepare the selected Ascend TP policy before cache profiling or capture."""
+        if not current_platform().is_npu:
+            return False
+        from tokenspeed.runtime.distributed.comm_backend.hccl_tp import (
+            prepare_hccl_tp_groups,
+        )
+
+        return prepare_hccl_tp_groups(
+            self.mapping.attn.tp_group, nprocs_per_node=self.mapping.nprocs_per_node
+        )
 
     @property
     def routed_experts_weights_of_layer(self):
@@ -3252,6 +3253,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             if isinstance(module, DeepseekV4MoE):
                 module.warmup()
         if current_platform().is_npu:
+            # This prepares codec constants, not an executable kernel choice.
             # Codec constants must exist before query partitioning leaves some
             # ranks idle: a blocking first-use H2D copy can wait behind collectives.
             from tokenspeed_kernel.ops.attention.dsv41.ascend import (

@@ -121,11 +121,9 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
             ctx,
             *,
             pending_post,
-            token_mask,
             allow_ffn_reduce_fusion,
             capture_input,
         ):
-            assert token_mask.dtype == torch.bool and token_mask.all()
             events.append(("layer", self.layer_id))
             assert allow_ffn_reduce_fusion == (
                 self.layer_id not in (19, 20) and self.layer_id < 36

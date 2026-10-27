@@ -373,14 +373,6 @@ class MoELayer(torch.nn.Module):
             deepep_low_latency_max_num_tokens_per_gpu = global_server_args_dict[
                 "low_latency_max_num_tokens_per_gpu"
             ]
-        elif self._spec.a2a_backend == "ascend_mc2":
-            mapping = global_server_args_dict["mapping"]
-            # MC2 owns its communication window. Framework collectives must
-            # not overwrite it; this runtime permits one MC2 domain per rank.
-            process_group = pg_manager.get_dedicated_device_group(
-                mapping.moe.ep_group,
-                "ascend_mc2",
-            )
         elif moe_backend == "mega_moe":
             mapping = global_server_args_dict["mapping"]
             process_group = pg_manager.get_device_process_group(mapping.moe.ep_group)

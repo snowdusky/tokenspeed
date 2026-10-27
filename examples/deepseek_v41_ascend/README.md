@@ -11,7 +11,10 @@ the same accumulation dtype and use host-driven HCCL. The four
 `TOKENSPEED_HCCL_TP_{REDUCE_DTYPE,REDUCE_ALGORITHM,GATHER_ALGORITHM,AIV_MAX_BYTES}`
 settings are required together. They apply to the configured rank group,
 including Dense and LM-head collectives when those layers share its ranks.
-Without these settings, ordinary HCCL behavior is unchanged.
+The V4.1 model prepares this policy through the existing
+`prepare_communication_runtime` hook, before cache profiling and graph capture.
+Other models do not install it. Without these settings, ordinary HCCL behavior
+is unchanged.
 
 The W4A4 path also requires the existing `flash_ops` FlatQuant extension,
 which registers `torch.ops.custom.flat_quant`.
@@ -53,7 +56,10 @@ integer operations instead of requiring native FP8 tensor conversion on 910.
 ## Expert load balancing
 
 V4.1 FlatQuant W4A4 supports the standard expert placement and online EPLB
-controller. For cross-node MC2, use EP32, EP64 or EP128 with MoE TP1. Start
+controller. MC2 selects a local-row load mask so idle and padded rows do not
+inflate expert counts; other transports keep their existing recorder layout.
+The model binds MC2's dedicated communicator before expert weight processing.
+For cross-node MC2, use EP32, EP64 or EP128 with MoE TP1. Start
 with one redundant expert slot per EP rank: `--ep-num-redundant-experts`
 counts extra slots across the entire EP group, not per device. For EP64:
 

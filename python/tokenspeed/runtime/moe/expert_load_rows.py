@@ -55,15 +55,20 @@ class ExpertLoadRowMask:
     Args:
         mapping: The parallel layout; it decides how the ranks' rows are laid
             out in the MoE input (``moe_input_row_segments``).
-        all_to_all_ep: Whether dispatch consumes only this rank's input shard
-            instead of the all-gathered MoE input.
     """
 
-    def __init__(self, mapping: Mapping, *, all_to_all_ep: bool) -> None:
+    def __init__(self, mapping: Mapping) -> None:
         self._mapping = mapping
-        self._all_to_all_ep = all_to_all_ep
+        self._all_to_all_ep = False
         # [max_rows] bool on the placement's device; None until reserved.
         self.mask: torch.Tensor | None = None
+
+    @classmethod
+    def for_all_to_all(cls, mapping: Mapping) -> ExpertLoadRowMask:
+        """Count this rank's dispatched rows instead of the gathered MoE input."""
+        rows = cls(mapping)
+        rows._all_to_all_ep = True
+        return rows
 
     @property
     def max_rows(self) -> int:

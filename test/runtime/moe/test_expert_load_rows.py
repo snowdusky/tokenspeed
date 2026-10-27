@@ -116,7 +116,7 @@ def test_mask_marks_filler_rows_then_clears_and_the_counters_follow():
     mapping = Mapping(
         rank=1, world_size=2, attn_tp_size=1, attn_dp_size=2, moe_ep_size=2
     )
-    rows = ExpertLoadRowMask(mapping, all_to_all_ep=False)
+    rows = ExpertLoadRowMask(mapping)
     with pytest.raises(RuntimeError, match="not been reserved"):
         rows.rows(1)
     rows.reserve(8, "cpu")
@@ -139,14 +139,12 @@ def test_mask_marks_filler_rows_then_clears_and_the_counters_follow():
 
 
 def test_mask_rejects_a_forward_wider_than_the_reservation():
-    rows = ExpertLoadRowMask(Mapping(rank=0, world_size=1), all_to_all_ep=False)
+    rows = ExpertLoadRowMask(Mapping(rank=0, world_size=1))
     rows.reserve(2, "cpu")
     with pytest.raises(ValueError, match="exceeds the reserved"):
         rows.mark_padded(padded_global_num_tokens=[3], live_global_num_tokens=[1])
     with pytest.raises(ValueError, match="positive"):
-        ExpertLoadRowMask(Mapping(rank=0, world_size=1), all_to_all_ep=False).reserve(
-            0, "cpu"
-        )
+        ExpertLoadRowMask(Mapping(rank=0, world_size=1)).reserve(0, "cpu")
 
 
 # ----------------------------------------------------------------------
@@ -193,7 +191,7 @@ def test_all_to_all_counts_only_local_live_rows(rank, live):
     mapping = Mapping(
         rank=rank, world_size=4, attn_tp_size=1, attn_dp_size=4, moe_ep_size=4
     )
-    rows = ExpertLoadRowMask(mapping, all_to_all_ep=True)
+    rows = ExpertLoadRowMask.for_all_to_all(mapping)
     rows.reserve(8, "cpu")
     rows.mark_padded(
         padded_global_num_tokens=[8] * 4,
@@ -213,7 +211,7 @@ def test_all_to_all_counts_attention_tp_local_shard(rank, live):
     mapping = Mapping(
         rank=rank, world_size=4, attn_tp_size=2, attn_dp_size=2, moe_ep_size=4
     )
-    rows = ExpertLoadRowMask(mapping, all_to_all_ep=True)
+    rows = ExpertLoadRowMask.for_all_to_all(mapping)
     rows.reserve(4, "cpu")
     rows.mark_padded(
         padded_global_num_tokens=[8] * 4,

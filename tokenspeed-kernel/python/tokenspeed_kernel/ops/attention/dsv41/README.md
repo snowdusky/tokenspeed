@@ -1,11 +1,6 @@
 # DeepSeek V4.1 attention on Ascend
 
 The Ascend operators use the existing shared operator contracts and LCM fields.
-Their NPU-only initialization supplies missing `torch.distributed` collective
-names on the Torch 2.9 stack: `all_gather_single` aliases `all_gather_into_tensor`,
-and `reduce_scatter_single` aliases `reduce_scatter_tensor`. Existing functions
-are preserved. The aliases are process-wide and retain asynchronous Work handles;
-no runtime communication or scheduling implementation is replaced.
 
 SWA stores E4M3 values with group-32 E8M0 scales; global KV stores E2M1 values
 with group-16 E4M3 scales; index K stores E2M1 values with group-32 E8M0 scales.

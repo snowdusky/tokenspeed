@@ -51,8 +51,7 @@ def _placement(ep_rank: int) -> ExpertLocationMetadata:
     placement.enable_load_recording(
         Mapping(
             rank=ep_rank, world_size=2, attn_tp_size=1, attn_dp_size=2, moe_ep_size=2
-        ),
-        all_to_all_ep=False,
+        )
     )
     placement.reserve_load_rows(8)
     return placement

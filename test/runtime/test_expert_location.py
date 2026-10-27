@@ -204,7 +204,7 @@ def test_load_record_is_per_rank_and_merges_across_ranks(tmp_path):
     records = []
     for ep_rank in (0, 1):
         placement = _placement(ep_rank)
-        placement.enable_load_recording(_mapping(), all_to_all_ep=False)
+        placement.enable_load_recording(_mapping())
         assert placement.physical_load.dtype == torch.int64
         # Each rank counted its own tokens' routes (all-to-all EP).
         placement.physical_load.copy_(
@@ -233,7 +233,7 @@ def test_load_record_is_per_rank_and_merges_across_ranks(tmp_path):
     # Records of another placement cannot be merged in.
     other = _placement(0)
     other.physical_to_logical_map_cpu[0, 0] = 1
-    other.enable_load_recording(_mapping(1), all_to_all_ep=False)
+    other.enable_load_recording(_mapping(1))
     torch.save(other.load_record(other.physical_load), tmp_path / "x.expert-load.pt")
     with pytest.raises(ValueError, match="different expert placement"):
         merge_expert_load_records(records + [tmp_path / "x.expert-load.pt"])
@@ -241,7 +241,7 @@ def test_load_record_is_per_rank_and_merges_across_ranks(tmp_path):
 
 def test_init_expert_location_merges_a_directory_of_records(tmp_path):
     placement = _placement(0)
-    placement.enable_load_recording(_mapping(), all_to_all_ep=False)
+    placement.enable_load_recording(_mapping())
     for ep_rank in (0, 1):
         placement.physical_load.fill_(ep_rank + 1)
         torch.save(
@@ -277,7 +277,7 @@ def test_init_expert_location_form_is_decided_by_shape_not_by_glob_characters(
     """Inline JSON, a directory, a file and a glob each take their own path;
     JSON containing ``[``/``?`` is never mistaken for a pattern."""
     placement = _placement(0)
-    placement.enable_load_recording(_mapping(), all_to_all_ep=False)
+    placement.enable_load_recording(_mapping())
     placement.physical_load.fill_(2)
     record = placement.load_record(placement.physical_load)
     torch.save(record, tmp_path / "p-TP0.expert-load.pt")
@@ -374,7 +374,10 @@ def test_eplb_placement_balances_a_skewed_load():
     assert placement.rank_dispatch_map().shape == (layers, experts)
 
 
-def test_build_expert_placement_refuses_models_that_do_not_opt_in():
+@pytest.mark.parametrize(
+    "backend", ["none", "agrs", "deepep", "flashinfer", "gluon_petit", "ascend_mc2"]
+)
+def test_build_expert_placement_refuses_models_that_do_not_opt_in(backend):
     from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 
     class Plain(BaseCausalLM):
@@ -395,8 +398,10 @@ def test_build_expert_placement_refuses_models_that_do_not_opt_in():
         expert_distribution_recorder_mode="stat",
         ep_dispatch_algorithm="static",
         enable_eplb=False,
-        all2all_backend="none",
-        mapping=_mapping(),
+        all2all_backend=backend,
+        mapping=Mapping(
+            rank=1, world_size=2, attn_tp_size=1, attn_dp_size=2, moe_ep_size=2
+        ),
     )
     model_config = SimpleNamespace(hf_config=None)
     assert not BaseCausalLM.supports_expert_placement
@@ -412,12 +417,20 @@ def test_build_expert_placement_refuses_models_that_do_not_opt_in():
         mock.patch.object(
             expert_location,
             "compute_initial_expert_location_metadata",
-            return_value=_placement(0),
+            return_value=_placement(1),
         ),
     ):
         placement = build_expert_placement(args, model_config)
     assert placement.physical_load is not None  # stat recording allocated
     assert placement.load_rows is not None  # with its live-row mask
+    placement.reserve_load_rows(8)
+    placement.load_rows.mark_padded(
+        padded_global_num_tokens=[4, 4], live_global_num_tokens=[4, 0]
+    )
+    if backend == "ascend_mc2":
+        assert not placement.load_rows.rows(4).any()
+    else:
+        assert placement.load_rows.rows(8).tolist() == [True] * 4 + [False] * 4
     # Without a request there is no placement, whatever the model.
     args.ep_num_redundant_experts = 0
     args.expert_distribution_recorder_mode = None
@@ -467,7 +480,7 @@ def test_replica_table_has_the_fixed_width_r_plus_one():
 
 def test_update_layers_rewrites_rows_in_place_and_reaches_the_views():
     placement = _placement(ep_rank=1)
-    placement.enable_load_recording(_mapping(), all_to_all_ep=False)
+    placement.enable_load_recording(_mapping())
     static_before = placement.rank_dispatch_map()
     # The router's views: the per-layer slices it indexes during a forward.
     replicas_view = placement.logical_to_all_physical_map[1]
@@ -521,7 +534,7 @@ def test_update_layers_rewrites_rows_in_place_and_reaches_the_views():
 
 def test_snapshot_load_reads_then_zeroes_the_counters_with_their_map():
     placement = _placement(ep_rank=0)
-    placement.enable_load_recording(_mapping(), all_to_all_ep=False)
+    placement.enable_load_recording(_mapping())
     placement.physical_load.copy_(
         torch.tensor([[1, 0, 0, 0, 1, 0], [0, 0, 1, 0, 1, 1]])
     )

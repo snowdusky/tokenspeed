@@ -438,7 +438,6 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
                 positions,
                 image_mask=None,
                 ctx=replace(ctx, attn_backend=backend),
-                token_mask=None,
                 pending_post=pending_post,
                 allow_ffn_reduce_fusion=stage + 1 < len(self.layers),
                 capture_input=False,
@@ -523,12 +522,9 @@ class DeepseekV41ForCausalLMDSpark(DeepseekV41ForCausalLM, TargetCaptureConfigur
                     # The context write's merged projection loads the same
                     # shard as this stage's own wq_a_wkv.
                     yield f"context_wkv.{stage}.{wkv[1]}", tensor
-                if (
-                    stage == 0
-                    and suffix.startswith(("main_proj.", "main_norm."))
-                    or stage == self.model.num_stages - 1
-                    and suffix == "norm.weight"
-                ):
+                if stage == 0 and suffix.startswith(("main_proj.", "main_norm.")):
+                    name = suffix
+                elif stage == self.model.num_stages - 1 and suffix == "norm.weight":
                     name = suffix
                 elif stage == self.model.num_stages - 1 and suffix in (
                     "markov_head.embed.weight",

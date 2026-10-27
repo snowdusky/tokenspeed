@@ -409,7 +409,7 @@ class ExpertLocationMetadata:
 
     # -------------------------------- load recording ---------------------------------
 
-    def enable_load_recording(self, mapping: Mapping, *, all_to_all_ep: bool) -> None:
+    def enable_load_recording(self, mapping: Mapping) -> None:
         """Allocate the per-physical-expert route counters the router bumps.
 
         int64: on replicated-input EP every rank counts every token's routes,
@@ -427,7 +427,7 @@ class ExpertLocationMetadata:
             dtype=torch.int64,
             device=self.physical_to_logical_map.device,
         )
-        self.load_rows = ExpertLoadRowMask(mapping, all_to_all_ep=all_to_all_ep)
+        self.load_rows = ExpertLoadRowMask(mapping)
 
     def reserve_load_rows(self, max_rows: int) -> None:
         """Reserve the live-row mask for the largest MoE input any forward carries."""
@@ -920,9 +920,10 @@ def build_expert_placement(
         )
     placement = compute_initial_expert_location_metadata(server_args, model_config)
     if server_args.expert_distribution_recorder_mode is not None:
-        placement.enable_load_recording(
-            server_args.mapping, all_to_all_ep=server_args.all2all_backend != "none"
-        )
+        placement.enable_load_recording(server_args.mapping)
+        if server_args.all2all_backend == "ascend_mc2":
+            # Bind the local-row layout before routers retain the shared mask.
+            placement.load_rows = ExpertLoadRowMask.for_all_to_all(server_args.mapping)
     logger.info(
         f"Expert placement: {placement.num_logical_experts} logical experts on "
         f"{placement.num_physical_experts} physical slots over "

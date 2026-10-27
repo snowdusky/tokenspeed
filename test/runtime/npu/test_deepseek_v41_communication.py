@@ -25,7 +25,6 @@ import os
 import pytest
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.attention import dsv41  # noqa: F401
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel_npu import register_torch_compat
 
@@ -122,8 +121,9 @@ def test_hccl_int64_argmax_acl_replay(mapping):
 
 @pytest.mark.parametrize("algorithm", ["host", "aiv"])
 def test_hccl_fp32_sum_keeps_precision_across_transport_sizes(mapping, algorithm):
-    from tokenspeed.runtime.distributed.comm_backend.hccl import (
+    from tokenspeed.runtime.distributed.comm_backend.hccl_tp import (
         AIV_TP_GROUP_NAME,
+        HcclTpBackend,
         HcclTpPolicy,
     )
 
@@ -138,7 +138,7 @@ def test_hccl_fp32_sum_keeps_precision_across_transport_sizes(mapping, algorithm
         pg_manager.init_process_group(
             group, backend="hccl", name=AIV_TP_GROUP_NAME, pg_options=options
         )
-    backend = HcclBackend()
+    backend = HcclTpBackend()
     policy = HcclTpPolicy(
         reduce_dtype="float32",
         reduce_algorithm=algorithm,
@@ -179,3 +179,49 @@ def test_hccl_fp32_sum_keeps_precision_across_transport_sizes(mapping, algorithm
                 gathered.cpu(), expected.repeat(mapping.world_size), atol=0, rtol=0
             )
         graph.reset()
+
+
+def test_v41_model_prepares_tp_policy_before_replay(mapping, monkeypatch):
+    from test.runtime.test_deepseek_v41_model import _loader_config, _loader_model
+
+    from tokenspeed.runtime.distributed.comm_backend import registry
+
+    # Meta weights keep construction cheap; collectives below use real NPU data.
+    with monkeypatch.context() as weights:
+        model = _loader_model(weights, _loader_config(), mapping.rank, "meta")
+    model.mapping = mapping
+    monkeypatch.setattr(registry, "_global_backend", HcclBackend())
+    for name, value in (
+        ("REDUCE_DTYPE", "float32"),
+        ("REDUCE_ALGORITHM", "aiv"),
+        ("GATHER_ALGORITHM", "aiv"),
+        ("AIV_MAX_BYTES", "2097152"),
+    ):
+        monkeypatch.setenv(f"TOKENSPEED_HCCL_TP_{name}", value)
+    assert model.prepare_communication_runtime(32)
+    assert model.prepare_communication_runtime(32)
+    backend = registry.get_global_backend()
+    source = torch.full((32,), mapping.rank + 1, dtype=torch.bfloat16, device="npu")
+    output = torch.empty_like(source)
+
+    def forward():
+        output.copy_(source)
+        backend.all_reduce(output, mapping.attn.tp_group)
+
+    forward()
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph, auto_dispatch_capture=True):
+        forward()
+    for factor in (1, 2):
+        source.fill_((mapping.rank + 1) * factor)
+        graph.replay()
+        torch.npu.synchronize()
+        expected = factor * mapping.world_size * (mapping.world_size + 1) // 2
+        torch.testing.assert_close(
+            output.cpu(),
+            torch.full((32,), expected, dtype=torch.bfloat16),
+            atol=0,
+            rtol=0,
+        )
+    graph.reset()
