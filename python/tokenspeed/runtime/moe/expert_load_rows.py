@@ -55,10 +55,13 @@ class ExpertLoadRowMask:
     Args:
         mapping: The parallel layout; it decides how the ranks' rows are laid
             out in the MoE input (``moe_input_row_segments``).
+        all_to_all_ep: Whether dispatch consumes only this rank's input shard
+            instead of the all-gathered MoE input.
     """
 
-    def __init__(self, mapping: Mapping) -> None:
+    def __init__(self, mapping: Mapping, *, all_to_all_ep: bool) -> None:
         self._mapping = mapping
+        self._all_to_all_ep = all_to_all_ep
         # [max_rows] bool on the placement's device; None until reserved.
         self.mask: torch.Tensor | None = None
 
@@ -114,6 +117,12 @@ class ExpertLoadRowMask:
             padded_global_num_tokens=padded_global_num_tokens,
             live_global_num_tokens=live_global_num_tokens,
         )
+        if self._all_to_all_ep and len(segments) > 1:
+            # All-to-all dispatch routes this rank's shard, not the gathered
+            # rows of its peers. An idle rank must count no padded routes.
+            segments = [
+                segments[self._mapping.moe.tp_ep_group.index(self._mapping.rank)]
+            ]
         total = sum(rows for rows, _ in segments)
         mask = self.rows(total)
         if all(live == rows for rows, live in segments):

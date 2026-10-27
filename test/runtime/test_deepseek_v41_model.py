@@ -244,6 +244,7 @@ class _DenseFFN(nn.Module):
             torch.empty(config.hidden_size, config.hidden_size, dtype=torch.bfloat16)
         )
         self.shared_experts = None
+        self.dp_replicated_rows = False
         self.use_mega_moe = False
         self.owns_ep_communication = False
         self.use_gluon_petit = False
@@ -382,6 +383,7 @@ def test_lm_head_checkpoint_and_logits_follow_model_dtype(
     config = _config()
     adapter = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
     nn.Module.__init__(adapter)
+    adapter.expert_placement = None
     adapter.mapping = _mapping(rank, tp_size, world_size)
     adapter.encoder_only = False
     adapter.vision = None
@@ -547,14 +549,41 @@ def test_empty_decoder_rows_complete_hc_and_preserve_ep_participation(
             layer._forward_ffn(hidden[:, 0, :], image_mask, ctx, defer_reduce=True)
 
 
-def test_idle_model_calls_every_ep_layer_with_completed_empty_state(monkeypatch):
+@pytest.mark.parametrize("shared_engram", [False, True])
+def test_idle_model_calls_every_ep_layer_with_completed_empty_state(
+    monkeypatch, shared_engram
+):
+    from tokenspeed.runtime.distributed import comm_ops
+    from tokenspeed.runtime.models import deepseek_v41_engram as engram
+    from tokenspeed.runtime.models.deepseek_v41_parallel import EngramRowExchange
+
     monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
     config = _config()
-    config.engram_layer_ids = []
+    if not shared_engram:
+        config.engram_layer_ids = []
     model = DeepseekV41Model(config, _mapping(0, 1, 1), None, "model", False, "gpu")
     model.mapping = SimpleNamespace(attn=SimpleNamespace(has_dp=True))
     calls = []
+    embedding_rows = []
+
+    def gather_rows(local, group, counts):
+        assert local.shape == (0, 6) and counts == [0, 5]
+        return torch.zeros((5, 6), dtype=torch.int64)
+
+    def reduce_embeddings(values, *, group, backend, op):
+        # Simulate the absent peer's table contribution. Idle ranks must
+        # exchange all peer rows before returning their empty local view.
+        embedding_rows.append(values.shape)
+        return values + 1
+
+    monkeypatch.setattr(comm_ops, "token_all_gather_rows", gather_rows)
+    monkeypatch.setattr(engram, "all_reduce", reduce_embeddings)
     for layer in model.layers:
+        if layer.engram is not None:
+            layer.engram.row_exchange = EngramRowExchange(0, 2, 1, 0, (0, 1))
+            layer.engram.embed.tp_group = (0, 1)
+            layer.engram.embed.weight.data.zero_()
+            layer.engram.embed.scale.data.fill_(127)
         layer.ffn.owns_ep_communication = True
         monkeypatch.setattr(
             layer.comm_manager,
@@ -580,10 +609,12 @@ def test_idle_model_calls_every_ep_layer_with_completed_empty_state(monkeypatch)
 
         monkeypatch.setattr(layer.ffn, "forward", ffn)
     ids = torch.empty(0, dtype=torch.int64)
+    ctx = _ctx(None, 0, ForwardMode.IDLE)
+    ctx.global_num_tokens = [0, 5]
     hidden, captured = model(
         ids,
         ids,
-        _ctx(None, 0, ForwardMode.IDLE),
+        ctx,
         None,
         None,
         engram_hash_ids=None,
@@ -592,6 +623,7 @@ def test_idle_model_calls_every_ep_layer_with_completed_empty_state(monkeypatch)
     )
     assert hidden.shape == (0, config.hidden_size) and captured is None
     assert calls == list(range(config.num_hidden_layers))
+    assert embedding_rows == [(5, 192)] * len(config.engram_layer_ids)
 
 
 @pytest.mark.parametrize("attention_dp", [False, True])
@@ -786,7 +818,7 @@ def test_reference_linear_construction_preserves_checkpoint_loading(
 ):
     # Exercise both storage contracts without requiring a Hopper allocation.
     monkeypatch.setattr(
-        v41, "current_platform", lambda: SimpleNamespace(is_hopper=hopper)
+        v41, "current_platform", lambda: SimpleNamespace(is_hopper=hopper, is_npu=False)
     )
     quant = v41_mxfp8_config(_quant())
     kwargs = dict(
@@ -1744,6 +1776,7 @@ def test_full_40_layer_backbone_engram_and_final_mix(monkeypatch):
         model.initialize_engram(_Tokenizer())
     adapter = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
     nn.Module.__init__(adapter)
+    adapter.expert_placement = None
     forwarded = adapter.prepare_model_kwargs(
         ctx, ids, {"engram_hash_ids": hashes, "engram_token_mask": mask}
     )
@@ -3220,7 +3253,10 @@ def test_strict_checkpoint_load_tp4_ep4(monkeypatch, rank, prefixed, reverse, tm
                 layer.attn.wq_b.weight, codes.to(torch.bfloat16), rtol=0, atol=0
             )
         else:
-            assert layer.attn.wq_b.weight.dtype == torch.float8_e4m3fn
+            storage_dtype = (
+                torch.uint8 if current_platform().is_npu else torch.float8_e4m3fn
+            )
+            assert layer.attn.wq_b.weight.dtype == storage_dtype
             torch.testing.assert_close(
                 layer.attn.wq_b.weight.view(torch.uint8),
                 codes.view(torch.uint8),
@@ -3501,6 +3537,8 @@ def test_routing_matches_reference_bias_and_normalization(topk, vision, with_ima
     moe.hash_indices_dtype = torch.int64
     moe.use_mega_moe = False
     moe.use_gluon_petit = False
+    moe.owns_ep_communication = False
+    moe.expert_dispatch = None
     empty = logits[:0]
     target = torch.empty_like(empty)
     assert moe(empty, image_mask, 0, 0) is empty
@@ -3636,3 +3674,22 @@ def test_short_history_skips_query_projections_but_preserves_keys(
     assert bool(backend.global_writes) == (layer_id in (2, 20))
     if layer_id in (2, 20):
         assert backend.global_writes[layer_id][1].numel() > 0
+
+
+def test_language_model_exposes_prepared_expert_slots(monkeypatch):
+    config = _loader_config()
+    model = _loader_model(monkeypatch, config, rank=0, device="meta")
+    expected = {}
+    for index, layer in enumerate(model.model.layers):
+        weights = layer.ffn.experts
+        tensors = [weights.w13_weight, weights.w2_weight]
+        # Replace only the hardware provider's prepared-storage callback.
+        monkeypatch.setitem(
+            weights.plan, "expert_slot_tensors", lambda tensors=tensors: tensors
+        )
+        expected[index] = tensors
+    actual = model.routed_experts_weights_of_layer
+    assert actual.keys() == expected.keys()
+    for index, tensors in actual.items():
+        assert all(left is right for left, right in zip(tensors, expected[index]))
+    assert list(model._local_expert_ids(0)) == list(range(config.n_routed_experts // 4))

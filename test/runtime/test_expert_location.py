@@ -204,7 +204,7 @@ def test_load_record_is_per_rank_and_merges_across_ranks(tmp_path):
     records = []
     for ep_rank in (0, 1):
         placement = _placement(ep_rank)
-        placement.enable_load_recording(_mapping())
+        placement.enable_load_recording(_mapping(), all_to_all_ep=False)
         assert placement.physical_load.dtype == torch.int64
         # Each rank counted its own tokens' routes (all-to-all EP).
         placement.physical_load.copy_(
@@ -233,7 +233,7 @@ def test_load_record_is_per_rank_and_merges_across_ranks(tmp_path):
     # Records of another placement cannot be merged in.
     other = _placement(0)
     other.physical_to_logical_map_cpu[0, 0] = 1
-    other.enable_load_recording(_mapping(1))
+    other.enable_load_recording(_mapping(1), all_to_all_ep=False)
     torch.save(other.load_record(other.physical_load), tmp_path / "x.expert-load.pt")
     with pytest.raises(ValueError, match="different expert placement"):
         merge_expert_load_records(records + [tmp_path / "x.expert-load.pt"])
@@ -241,7 +241,7 @@ def test_load_record_is_per_rank_and_merges_across_ranks(tmp_path):
 
 def test_init_expert_location_merges_a_directory_of_records(tmp_path):
     placement = _placement(0)
-    placement.enable_load_recording(_mapping())
+    placement.enable_load_recording(_mapping(), all_to_all_ep=False)
     for ep_rank in (0, 1):
         placement.physical_load.fill_(ep_rank + 1)
         torch.save(
@@ -277,7 +277,7 @@ def test_init_expert_location_form_is_decided_by_shape_not_by_glob_characters(
     """Inline JSON, a directory, a file and a glob each take their own path;
     JSON containing ``[``/``?`` is never mistaken for a pattern."""
     placement = _placement(0)
-    placement.enable_load_recording(_mapping())
+    placement.enable_load_recording(_mapping(), all_to_all_ep=False)
     placement.physical_load.fill_(2)
     record = placement.load_record(placement.physical_load)
     torch.save(record, tmp_path / "p-TP0.expert-load.pt")
@@ -395,6 +395,7 @@ def test_build_expert_placement_refuses_models_that_do_not_opt_in():
         expert_distribution_recorder_mode="stat",
         ep_dispatch_algorithm="static",
         enable_eplb=False,
+        all2all_backend="none",
         mapping=_mapping(),
     )
     model_config = SimpleNamespace(hf_config=None)
@@ -466,7 +467,7 @@ def test_replica_table_has_the_fixed_width_r_plus_one():
 
 def test_update_layers_rewrites_rows_in_place_and_reaches_the_views():
     placement = _placement(ep_rank=1)
-    placement.enable_load_recording(_mapping())
+    placement.enable_load_recording(_mapping(), all_to_all_ep=False)
     static_before = placement.rank_dispatch_map()
     # The router's views: the per-layer slices it indexes during a forward.
     replicas_view = placement.logical_to_all_physical_map[1]
@@ -520,7 +521,7 @@ def test_update_layers_rewrites_rows_in_place_and_reaches_the_views():
 
 def test_snapshot_load_reads_then_zeroes_the_counters_with_their_map():
     placement = _placement(ep_rank=0)
-    placement.enable_load_recording(_mapping())
+    placement.enable_load_recording(_mapping(), all_to_all_ep=False)
     placement.physical_load.copy_(
         torch.tensor([[1, 0, 0, 0, 1, 0], [0, 0, 1, 0, 1, 1]])
     )
@@ -604,3 +605,23 @@ def test_compute_placement_maps_is_host_only_and_init_by_eplb_wraps_it():
     assert seen["ep_size"] == 4 and seen["num_physical_experts"] == 12
     assert placement.ep_rank == 2 and placement.ep_rank_nodes == (0, 0, 0, 0)
     assert torch.equal(placement.physical_to_logical_map, phy2log)
+
+
+@pytest.mark.parametrize("rank", range(4))
+@pytest.mark.parametrize("nodes", [(0, 0, 1, 1), (0, 1, 2, 3)])
+def test_static_dispatch_host_work_ignores_default_device(rank, nodes):
+    replicas = torch.tensor([[[0, 4], [1, 5], [2, 6], [3, 7]]], dtype=torch.int32)
+    arguments = dict(
+        logical_to_all_physical_map=replicas,
+        num_physical_experts=8,
+        ep_rank_nodes=nodes,
+        ep_rank=rank,
+    )
+    expected = expert_location.compute_logical_to_rank_dispatch_physical_map(
+        **arguments
+    )
+    with torch.device("meta"):
+        actual = expert_location.compute_logical_to_rank_dispatch_physical_map(
+            **arguments
+        )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)

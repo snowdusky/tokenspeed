@@ -39,6 +39,7 @@ from types import SimpleNamespace
 import torch
 from tokenspeed_kernel.ops.attention import dsv41
 from tokenspeed_kernel.ops.attention.dsv41 import rope_inplace
+from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32
 from torch import nn
 
 from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
@@ -132,7 +133,7 @@ class _WindowAttention:
         the target writes its own SWA rows.
         """
         batch, block = self.history_slots.shape[0], self.block_size
-        if swa.is_cuda and swa.shape[-1] == 512:
+        if swa.device.type in ("cuda", "npu") and swa.shape[-1] == 512:
             return dsv41.dspark_workspace(
                 swa,
                 swa_norm_weight,
@@ -145,7 +146,7 @@ class _WindowAttention:
                 block,
             )
         if swa_norm_weight is not None:
-            raise ValueError("A deferred SWA norm requires 512-wide CUDA rows")
+            raise ValueError("A deferred SWA norm requires 512-wide device rows")
         history = self.window[self.selection.page, self.selection.row]
         if swa_rope_cache is not None:
             swa = rope_inplace(swa.clone(), positions, swa_rope_cache, None)
@@ -176,7 +177,7 @@ class _WindowAttention:
         kv = self._workspace(
             swa, positions, swa_rope_cache, swa_norm_weight, swa_norm_eps
         )
-        if q.is_cuda and q.shape[-1] == 512:
+        if q.device.type in ("cuda", "npu") and q.shape[-1] == 512:
             out = self._kernel_forward(q, kv, attn_sink, softmax_scale)
         else:
             out = self._reference_forward(q, kv, attn_sink, softmax_scale)
@@ -246,6 +247,8 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
         flat = hidden_states.reshape(-1, hidden_states.shape[-1])
         if flat.is_cuda:
             logits = torch.mm(flat, head.T, out_dtype=torch.float32)
+        elif flat.device.type == "npu":
+            logits = dsv4_linear_fp32(flat, head)
         else:
             logits = flat.float() @ head.float().T
         return logits.view(*hidden_states.shape[:-1], head.shape[0])
@@ -376,7 +379,7 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
         for stage, layer in enumerate(self.layers):
             window = cache_pool.dspark_kv(stage)
             stage_kv = kv[:, stage * head_dim : (stage + 1) * head_dim]
-            if kv.is_cuda and head_dim == 512:
+            if kv.device.type in ("cuda", "npu") and head_dim == 512:
                 layer.attn.rotary_emb._prepare_cache(kv.device)
                 dsv41.dspark_rows(
                     stage_kv,
@@ -435,6 +438,7 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
                 positions,
                 image_mask=None,
                 ctx=replace(ctx, attn_backend=backend),
+                token_mask=None,
                 pending_post=pending_post,
                 allow_ffn_reduce_fusion=stage + 1 < len(self.layers),
                 capture_input=False,
@@ -519,9 +523,12 @@ class DeepseekV41ForCausalLMDSpark(DeepseekV41ForCausalLM, TargetCaptureConfigur
                     # The context write's merged projection loads the same
                     # shard as this stage's own wq_a_wkv.
                     yield f"context_wkv.{stage}.{wkv[1]}", tensor
-                if stage == 0 and suffix.startswith(("main_proj.", "main_norm.")):
-                    name = suffix
-                elif stage == self.model.num_stages - 1 and suffix == "norm.weight":
+                if (
+                    stage == 0
+                    and suffix.startswith(("main_proj.", "main_norm."))
+                    or stage == self.model.num_stages - 1
+                    and suffix == "norm.weight"
+                ):
                     name = suffix
                 elif stage == self.model.num_stages - 1 and suffix in (
                     "markov_head.embed.weight",

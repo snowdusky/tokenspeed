@@ -91,7 +91,8 @@ def _placement(old_map, ep_rank, ep_rank_nodes):
     placement.enable_load_recording(
         Mapping(
             rank=ep_rank, world_size=len(ep_rank_nodes), moe_ep_size=len(ep_rank_nodes)
-        )
+        ),
+        all_to_all_ep=False,
     )
     return placement
 

@@ -1062,7 +1062,9 @@ def test_expert_load_reset_and_dump_ride_the_execution_stream(tmp_path):
         ep_rank=1,
         ep_rank_nodes=(0, 0),
     )
-    placement.enable_load_recording(Mapping(rank=1, world_size=2, moe_ep_size=2))
+    placement.enable_load_recording(
+        Mapping(rank=1, world_size=2, moe_ep_size=2), all_to_all_ep=False
+    )
     placement.physical_load.copy_(torch.tensor([[3, 1, 2, 5], [0, 4, 0, 4]]))
     streams: list = []
 
@@ -1114,7 +1116,9 @@ def test_expert_load_counters_start_serving_at_zero_after_the_startup_forwards()
     placement = expert_location.ExpertLocationMetadata.from_physical_to_logical_map(
         torch.tensor([[0, 1, 2, 0]]), 3, ep_size=2, ep_rank=0, ep_rank_nodes=(0, 0)
     )
-    placement.enable_load_recording(Mapping(rank=0, world_size=2, moe_ep_size=2))
+    placement.enable_load_recording(
+        Mapping(rank=0, world_size=2, moe_ep_size=2), all_to_all_ep=False
+    )
     placement.physical_load.copy_(torch.tensor([[3, 1, 2, 5]]))  # startup routes
     trace: list = []
 
@@ -1157,7 +1161,9 @@ def test_expert_load_snapshot_reads_then_zeroes_on_the_execution_stream():
         ep_rank=1,
         ep_rank_nodes=(0, 0),
     )
-    placement.enable_load_recording(Mapping(rank=1, world_size=2, moe_ep_size=2))
+    placement.enable_load_recording(
+        Mapping(rank=1, world_size=2, moe_ep_size=2), all_to_all_ep=False
+    )
     placement.physical_load.copy_(torch.tensor([[3, 1, 2, 5], [0, 4, 0, 4]]))
     streams: list = []
 

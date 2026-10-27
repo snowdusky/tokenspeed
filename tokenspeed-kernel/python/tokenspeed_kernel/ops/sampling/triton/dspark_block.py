@@ -266,6 +266,23 @@ def dspark_block_greedy_step(
         ValueError: A tensor is not the shape, dtype or layout the kernel
             indexes with, or ``step`` is outside the block.
     """
+    if base_logits.device.type == "npu":
+        from tokenspeed_kernel_npu.ops.dspark_block import (
+            dspark_block_greedy_step as ascend_step,
+        )
+
+        return ascend_step(
+            base_logits,
+            step,
+            anchor_ids,
+            candidates,
+            embedding,
+            projection,
+            vocab_start,
+            num_valid,
+            partials,
+            output,
+        )
     if base_logits.ndim != 3 or base_logits.dtype != torch.float32:
         raise ValueError("base_logits must be a 3D FP32 tensor")
     if base_logits.stride(2) != 1:

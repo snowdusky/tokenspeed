@@ -74,3 +74,38 @@ if current_platform().is_npu:
             q_rope_out=q_rope_out,
             k_rope_out=k_rope_out,
         )
+
+
+if current_platform().is_npu:
+    from tokenspeed_kernel_npu.ops.mxfp import mxfp8_embedding
+
+    @register_kernel(
+        "embedding",
+        "mxfp8_embedding",
+        name="ascend_mxfp8_embedding",
+        solution="ascend",
+        capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+        signatures=format_signatures("weight", "dense", {torch.uint8}),
+        priority=Priority.PERFORMANT,
+    )
+    def ascend_mxfp8_embedding(weight, scales, indices, row_start, row_end):
+        return mxfp8_embedding(weight, scales, indices, row_start, row_end)
+
+
+if current_platform().is_npu:
+
+    @register_kernel(
+        "embedding",
+        "prepare_host_mxfp8_embedding",
+        name="ascend_prepare_host_mxfp8_embedding",
+        solution="ascend",
+        capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+        signatures=format_signatures(
+            "weight", "dense", {torch.uint8, torch.float8_e4m3fn}
+        ),
+        priority=Priority.PERFORMANT,
+    )
+    def ascend_prepare_host_mxfp8_embedding(weight, scales, row_start, row_end):
+        from tokenspeed_kernel_npu.ops.host_mxfp8 import HostMXFP8Embedding
+
+        return HostMXFP8Embedding(weight, scales, row_start, row_end)

@@ -50,6 +50,7 @@ class All2AllBackend(Enum):
     DEEPEP = "deepep"
     FLASHINFER = "flashinfer"
     GLUON_PETIT = "gluon_petit"
+    ASCEND_MC2 = "ascend_mc2"
 
     @classmethod
     def _missing_(cls, value):

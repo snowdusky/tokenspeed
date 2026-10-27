@@ -1049,6 +1049,7 @@ def test_autotune_covers_the_draft_experts_once_per_geometry(monkeypatch):
             self.b = moe_layer("draft.b", 128)  # same geometry: tuned once
             self.c = moe_layer("draft.c", 64)  # different geometry
             self.d = moe_layer("draft.d", 128, a2a="deepep")  # collective: skipped
+            self.e = moe_layer("draft.e", 256, a2a="ascend_mc2")
 
     calls = []
 

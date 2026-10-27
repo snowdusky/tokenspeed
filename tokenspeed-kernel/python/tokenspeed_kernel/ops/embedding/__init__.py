@@ -426,7 +426,7 @@ def mxfp8_embedding(weight, scales, indices, row_start, row_end):
     """Gather BF16 embeddings from a row shard of an MXFP8 table.
 
     Args:
-        weight: FP8 E4M3 codes [local_capacity,D], with contiguous columns.
+        weight: E4M3 codes [local_capacity,D] (uint8 on Ascend), with contiguous columns.
         scales: E8M0 exponent bytes [local_capacity,D/32].
         indices: Integer IDs on the table's GPU. Contiguous tensors may have
             any shape; two-dimensional tensors may also have strided rows
@@ -438,7 +438,12 @@ def mxfp8_embedding(weight, scales, indices, row_start, row_end):
         BF16 embeddings [*indices.shape,D]; nonlocal IDs produce zero rows.
         The caller owns any collective needed to combine shards.
     """
-    if weight.ndim != 2 or weight.shape[1] % 32 or weight.dtype != torch.float8_e4m3fn:
+    if (
+        weight.ndim != 2
+        or weight.shape[1] % 32
+        or weight.dtype
+        != (torch.uint8 if weight.device.type == "npu" else torch.float8_e4m3fn)
+    ):
         raise ValueError(
             "MXFP8 embedding weight must be E4M3 [rows,D] with D divisible by 32"
         )
@@ -450,7 +455,7 @@ def mxfp8_embedding(weight, scales, indices, row_start, row_end):
     if not 0 <= row_start <= row_end <= row_start + weight.shape[0]:
         raise ValueError("MXFP8 embedding shard range exceeds table capacity")
     if (
-        not indices.is_cuda
+        indices.device.type not in ("cuda", "npu")
         or indices.dtype not in (torch.int32, torch.int64)
         or (not indices.is_contiguous() and indices.ndim != 2)
         or weight.stride(1) != 1
@@ -528,3 +533,28 @@ def vocab_shard_embedding(
         solution=None,
     )
     return kernel(weight, indices, org_range, num_org_padding, added_range)
+
+
+def prepare_host_mxfp8_embedding(weight, scales, row_start, row_end):
+    """Map a host MXFP8 embedding shard for device-side lookup before capture.
+
+    Args:
+        weight: Page-aligned CPU E4M3 codes, shaped [local_rows, 256].
+        scales: Page-aligned CPU uint8 E8M0 scales, shaped [local_rows, 8].
+        row_start: First global row owned by this shard.
+        row_end: Exclusive end of the shard's global row range.
+
+    Returns:
+        A callable owner retaining both tables and their device mappings. Its
+        ``close()`` method must only be called after all lookup and graph work
+        has finished. IDs outside the shard produce zeros.
+    """
+    kernel = select_kernel(
+        "embedding",
+        "prepare_host_mxfp8_embedding",
+        format_signature(weight=dense_tensor_format(weight.dtype)),
+        traits=None,
+        override=None,
+        solution=None,
+    )
+    return kernel(weight, scales, row_start, row_end)

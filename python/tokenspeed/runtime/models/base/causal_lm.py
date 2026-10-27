@@ -258,11 +258,11 @@ class BaseCausalLM(nn.Module):
 
         return LogitsProcessor(
             config,
-            skip_all_gather=self.mapping.attn.has_dp,
+            skip_all_gather=self.mapping.lm_head_skip_all_gather,
             tp_rank=self.mapping.lm_head.tp_rank,
             tp_size=self.mapping.lm_head.tp_size,
             tp_group=self.mapping.lm_head.tp_group,
-            dp_lm_head_tp=self.mapping.attn.has_dp and self.mapping.lm_head.has_tp,
+            dp_lm_head_tp=self.mapping.lm_head_crosses_attention_dp,
         )
 
     def post_init(self) -> None:
@@ -273,12 +273,10 @@ class BaseCausalLM(nn.Module):
         self.capture_aux_hidden_states = True
 
         if layer_ids is None:
-
             num_layers = self.config.num_hidden_layers
             self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
 
         else:
-
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
@@ -396,12 +394,10 @@ class BaseCausalLM(nn.Module):
         loaded: set[str] = set()
 
         for name, loaded_weight in weights:
-
             if any(pattern in name for pattern in skip_patterns):
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
-
                 if weight_name not in name:
                     continue
 
@@ -420,7 +416,6 @@ class BaseCausalLM(nn.Module):
                 break
 
             else:
-
                 if name.endswith(".bias") and name not in params_dict:
                     continue
 

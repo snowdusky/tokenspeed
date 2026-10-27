@@ -409,7 +409,7 @@ class ExpertLocationMetadata:
 
     # -------------------------------- load recording ---------------------------------
 
-    def enable_load_recording(self, mapping: Mapping) -> None:
+    def enable_load_recording(self, mapping: Mapping, *, all_to_all_ep: bool) -> None:
         """Allocate the per-physical-expert route counters the router bumps.
 
         int64: on replicated-input EP every rank counts every token's routes,
@@ -427,7 +427,7 @@ class ExpertLocationMetadata:
             dtype=torch.int64,
             device=self.physical_to_logical_map.device,
         )
-        self.load_rows = ExpertLoadRowMask(mapping)
+        self.load_rows = ExpertLoadRowMask(mapping, all_to_all_ep=all_to_all_ep)
 
     def reserve_load_rows(self, max_rows: int) -> None:
         """Reserve the live-row mask for the largest MoE input any forward carries."""
@@ -774,7 +774,7 @@ def compute_logical_to_rank_dispatch_physical_map(
     if not 0 <= ep_rank < num_gpus:
         raise ValueError(f"ep_rank={ep_rank} is outside the {num_gpus} EP ranks")
     num_local = num_physical_experts // num_gpus
-    nodes = torch.tensor(list(ep_rank_nodes), dtype=torch.int64)
+    nodes = torch.tensor(list(ep_rank_nodes), dtype=torch.int64, device="cpu")
     num_nodes = int(nodes.max().item()) + 1
 
     replicas = logical_to_all_physical_map.cpu().to(torch.int64)
@@ -789,7 +789,10 @@ def compute_logical_to_rank_dispatch_physical_map(
     # [layers, experts, gpus] instead of a loop over the gpus.
     def first_replica_on(owner: torch.Tensor, count: int) -> torch.Tensor:
         first = torch.full(
-            (num_layers, num_logical_experts, count), -1, dtype=torch.int64
+            (num_layers, num_logical_experts, count),
+            -1,
+            dtype=torch.int64,
+            device="cpu",
         )
         for column in reversed(range(max_replicas)):
             index = owner[..., column].clamp_min(0).unsqueeze(-1)
@@ -822,6 +825,7 @@ def compute_logical_to_rank_dispatch_physical_map(
         column[unassigned] = torch.tensor(
             _fair_choices(candidates, k=int(unassigned.sum().item()), r=r),
             dtype=torch.int64,
+            device="cpu",
         )
 
     return (
@@ -916,7 +920,9 @@ def build_expert_placement(
         )
     placement = compute_initial_expert_location_metadata(server_args, model_config)
     if server_args.expert_distribution_recorder_mode is not None:
-        placement.enable_load_recording(server_args.mapping)
+        placement.enable_load_recording(
+            server_args.mapping, all_to_all_ep=server_args.all2all_backend != "none"
+        )
     logger.info(
         f"Expert placement: {placement.num_logical_experts} logical experts on "
         f"{placement.num_physical_experts} physical slots over "

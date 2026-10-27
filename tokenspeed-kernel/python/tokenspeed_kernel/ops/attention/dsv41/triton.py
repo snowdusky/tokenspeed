@@ -394,8 +394,10 @@ def _scale_bytes(cache_format):
 
 
 def _same_device(x, tensors):
-    if not x.is_cuda or any(t.device != x.device for t in tensors if t is not None):
-        raise ValueError("all tensors must share a CUDA/ROCm device")
+    if x.device.type not in ("cuda", "npu") or any(
+        t.device != x.device for t in tensors if t is not None
+    ):
+        raise ValueError("all tensors must share a CUDA/ROCm or Ascend device")
 
 
 def _integers(x, shape, name):
@@ -637,6 +639,8 @@ def compressor_tail_scatter(content, scores, tail, slots):
     priority=Priority.PORTABLE,
 )
 def index_q_quantize(q, cache_format, out):
+    from tokenspeed_kernel.ops.attention.dsv41 import cache_pack, cache_unpack
+
     if q.ndim != 3 or q.shape[-1] != 128 or q.dtype != torch.bfloat16:
         raise ValueError("index q must be BF16 [tokens, heads, 128]")
     out = _output(out, q.shape, q.dtype, q.device)
@@ -781,6 +785,8 @@ def selected_attention(
 
 
 def _score(q, weights, cache, slots, process_group):
+    from tokenspeed_kernel.ops.attention.dsv41 import cache_gather
+
     q, weights, shards = _index_gather_heads(q, weights, process_group)
     keys = cache_gather(cache, slots, _paged_format(cache, "index"), None)
     # Reference einsum materializes BF16 dots; weighting and each shard's head
@@ -1050,7 +1056,10 @@ def _index_gather_heads(q, weights, process_group):
     gathered = torch.empty(
         (shards * q.shape[0], q.shape[1], 129), dtype=weights.dtype, device=q.device
     )
-    torch.distributed.all_gather_single(gathered, packed, group=process_group)
+    if q.device.type == "npu":
+        torch.distributed.all_gather_into_tensor(gathered, packed, group=process_group)
+    else:
+        torch.distributed.all_gather_single(gathered, packed, group=process_group)
     gathered = gathered.view(shards, *packed.shape).permute(1, 0, 2, 3).flatten(1, 2)
     return gathered[..., :128].to(torch.bfloat16), gathered[..., 128], shards
 
@@ -1353,10 +1362,11 @@ def _compressor_pool(
     O0: tl.constexpr,
     O1: tl.constexpr,
     PAGES: tl.constexpr,
+    USE_LIBDEVICE: tl.constexpr,
 ):
     row = tl.program_id(0)
     channels = tl.arange(0, 512)
-    live = tl.load(ACTIVE + row * A0)
+    live = tl.load(ACTIVE + row * A0).to(tl.int1)
     previous = tl.load(PREVIOUS + row * P0)
     slot = tl.load(SLOTS + row * S0)
     in_current = live & (previous >= 0) & (previous < N)
@@ -1371,8 +1381,13 @@ def _compressor_pool(
     current = tl.load(CONTENT + row * C0 + channels * C1, live, 0.0)
     scores = tl.load(SCORES + row * G0 + channels * G1, live, 0.0)
     maximum = tl.maximum(old_scores, scores)
-    old_exp = libdevice.exp(old_scores - maximum)
-    new_exp = libdevice.exp(scores - maximum)
+    if USE_LIBDEVICE:
+        old_exp = libdevice.exp(old_scores - maximum)
+        new_exp = libdevice.exp(scores - maximum)
+    else:
+        # Triton-Ascend's libdevice.exp is an unimplemented stub.
+        old_exp = tl.exp(old_scores - maximum)
+        new_exp = tl.exp(scores - maximum)
     denominator = old_exp + new_exp
     old_weight = tl.div_rn(old_exp, denominator)
     new_weight = tl.div_rn(new_exp, denominator)
@@ -1464,6 +1479,7 @@ def compressor_pool(
             *tail.stride(),
             *out.stride(),
             tail.shape[0],
+            content.device.type != "npu",
             num_warps=4,
             enable_fp_fusion=False,
         )

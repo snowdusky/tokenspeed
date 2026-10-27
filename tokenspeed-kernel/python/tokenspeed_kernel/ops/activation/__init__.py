@@ -44,6 +44,10 @@ def silu_and_mul(
     the CUDA implementation does not expose the checkpoint's clamp semantics.
 
     """
+    if current_platform().is_npu and x.dtype == torch.bfloat16:
+        from tokenspeed_kernel.ops.activation.ascend import reference_silu_and_mul
+
+        return reference_silu_and_mul(x, out, limit=limit)
     if current_platform().is_npu and limit is None:
         from tokenspeed_kernel.ops.activation.ascend import silu_and_mul as npu_swiglu
 

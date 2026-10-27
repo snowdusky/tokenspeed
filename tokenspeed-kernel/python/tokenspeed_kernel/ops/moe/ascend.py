@@ -26,6 +26,7 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 if current_platform().is_npu:
+    from tokenspeed_kernel_npu.ops.dsv41_moe import mxfp4_bf16_moe_apply
     from tokenspeed_kernel_npu.ops.moe import (
         ascend_bf16_distributed_precomputed_moe_apply as _distributed_moe_apply,
     )
@@ -43,6 +44,10 @@ if current_platform().is_npu:
     )
     from tokenspeed_kernel_npu.ops.moe import (
         ascend_softmax_bias_topk as _softmax_bias_topk,
+    )
+    from tokenspeed_kernel_npu.ops.mxfp import (
+        preserve_mxfp4_moe_weights,
+        process_mxfp4_bf16_moe_weights,
     )
     from tokenspeed_kernel_npu.ops.w4a4 import (
         ascend_int4_precomputed_moe_apply as _int4_moe_apply,
@@ -67,6 +72,50 @@ if current_platform().is_npu:
     )
     def softmax_bias_topk(**kwargs):
         return _softmax_bias_topk(**kwargs)
+
+    _V41_TRAITS = {
+        "weight_dtype": frozenset({"mxfp4"}),
+        "activation": frozenset({"swiglu"}),
+        "activation_clamped": frozenset({True}),
+        "swiglu_form": frozenset({"standard"}),
+        "routing_mode": frozenset({"precomputed_topk"}),
+        "supports_deferred_finalize": frozenset({False}),
+        "supports_ep": frozenset({True}),
+        "supports_all_to_all_ep": frozenset({False}),
+        "ispp_alignment": frozenset({32}),
+        "internal_activation_dtype": frozenset({"input"}),
+        "supports_bias": frozenset({False}),
+    }
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="ascend_v41_bf16_moe_apply",
+        solution="ascend_v41_bf16",
+        capability=_CAPABILITY,
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={**_V41_TRAITS, "weight_dtype": frozenset({"mxfp4", "unquant"})},
+        priority=Priority.SPECIALIZED,
+        features={"ascend", "cuda_graph"},
+        weight_preprocessor=process_mxfp4_bf16_moe_weights,
+    )
+    def ascend_v41_bf16_moe_apply(**kwargs):
+        return mxfp4_bf16_moe_apply(**kwargs)
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="ascend_v41_mxfp4_moe_apply",
+        solution="ascend_v41_mxfp4",
+        capability=_CAPABILITY,
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits=_V41_TRAITS,
+        priority=Priority.SPECIALIZED,
+        features={"ascend", "cuda_graph"},
+        weight_preprocessor=preserve_mxfp4_moe_weights,
+    )
+    def ascend_v41_mxfp4_moe_apply(**kwargs):
+        return mxfp4_bf16_moe_apply(**kwargs)
 
     @register_kernel(
         "moe",
@@ -170,3 +219,71 @@ if current_platform().is_npu:
 
 
 __all__ = ["moe_apply", "softmax_bias_topk"]
+
+
+if current_platform().is_npu:
+    from tokenspeed_kernel_npu.ops.dsv41_w4a4 import moe_apply as _v41_w4a4_apply
+    from tokenspeed_kernel_npu.ops.dsv41_w4a4 import (
+        process_weights as _v41_w4a4_prepare,
+    )
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="ascend_v41_w4a4_moe_apply",
+        solution="ascend_v41_w4a4",
+        capability=_CAPABILITY,
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            "weight_dtype": frozenset({"int4"}),
+            "activation": frozenset({"swiglu"}),
+            "activation_clamped": frozenset({True}),
+            "swiglu_form": frozenset({"standard"}),
+            "routing_mode": frozenset({"precomputed_topk"}),
+            "supports_deferred_finalize": frozenset({False}),
+            "supports_ep": frozenset({True}),
+            "supports_all_to_all_ep": frozenset({False}),
+            "ispp_alignment": frozenset({64}),
+            "internal_activation_dtype": frozenset({"int4"}),
+            "supports_bias": frozenset({False}),
+        },
+        priority=Priority.SPECIALIZED,
+        features={"ascend", "cuda_graph", "w4a4", "flatquant", "nz"},
+        weight_preprocessor=_v41_w4a4_prepare,
+    )
+    def ascend_v41_w4a4_moe_apply(**kwargs):
+        return _v41_w4a4_apply(**kwargs)
+
+    from tokenspeed_kernel_npu.ops.dsv41_mc2 import moe_apply as _v41_mc2_apply
+    from tokenspeed_kernel_npu.ops.dsv41_mc2 import process_weights as _v41_mc2_prepare
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="ascend_v41_w4a4_mc2_moe_apply",
+        solution="ascend_v41_w4a4",
+        capability=_CAPABILITY,
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            "weight_dtype": frozenset({"int4"}),
+            "activation": frozenset({"swiglu"}),
+            "activation_clamped": frozenset({True}),
+            "swiglu_form": frozenset({"standard"}),
+            "routing_mode": frozenset({"precomputed_topk"}),
+            "supports_deferred_finalize": frozenset({False}),
+            "supports_ep": frozenset({True}),
+            "supports_all_to_all_ep": frozenset({True}),
+            "a2a_backend": frozenset({"ascend_mc2"}),
+            "expert_id_repeats": frozenset({False}),
+            "ep_size": frozenset({32, 64, 128}),
+            "combine_order": frozenset({"rank"}),
+            "ispp_alignment": frozenset({64}),
+            "internal_activation_dtype": frozenset({"int4"}),
+            "supports_bias": frozenset({False}),
+        },
+        priority=Priority.SPECIALIZED,
+        features={"ascend", "cuda_graph", "w4a4", "flatquant", "nz"},
+        weight_preprocessor=_v41_mc2_prepare,
+    )
+    def ascend_v41_w4a4_mc2_moe_apply(**kwargs):
+        return _v41_mc2_apply(**kwargs)

@@ -241,6 +241,12 @@ Consequences:
   the result; on the forward thread, the landing of a completed remote
   prefill and the KV repair after a wake complete before anything queued
   behind them runs. A new blocking operation on the per-round path is a bug.
+  On NPU, output copies use a stream leased until that result is committed:
+  event-only completion has exposed unfinished host copies under long mixed
+  workloads. Commit synchronizes that copy stream, which contains no later
+  forwards or collectives. The producer waits for the copies before reusing
+  its output buffers, and the completion retains their source tensors. Other
+  devices keep event completion; scheduling and commit ownership are unchanged.
 * Keep per-forward state resets asynchronous on the execution stream too.
   Use device-side scalar fills for indexed flags: assigning a Python scalar
   through tensor indexing can stage a CPU tensor and introduce a hidden

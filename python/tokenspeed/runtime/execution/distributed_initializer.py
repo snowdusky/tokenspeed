@@ -238,6 +238,15 @@ class DistributedInitializer:
         pg_manager.init_process_group(config.mapping.lm_head.tp_group)
         pg_manager.init_process_group(config.mapping.dense.tp_group)
         pg_manager.init_process_group(config.mapping.moe.tp_ep_group)
+        if backend == "hccl" and not config.emulate_rank_zero:
+            from tokenspeed.runtime.distributed.comm_backend.hccl import (
+                prepare_hccl_tp_groups,
+            )
+
+            prepare_hccl_tp_groups(
+                config.mapping.attn.tp_group, nprocs_per_node=config.nprocs_per_node
+            )
+
         if config.mapping.has_pp:
             # Cross-stage group for hidden-state P2P (nccl) and small control
             # broadcasts like the sampled first token (gloo).

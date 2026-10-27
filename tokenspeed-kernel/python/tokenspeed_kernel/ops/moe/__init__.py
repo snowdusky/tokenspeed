@@ -1394,7 +1394,7 @@ def _uses_all_to_all_ep(a2a_backend: str | None) -> bool:
 
 
 def _validate_a2a_backend(a2a_backend: str | None) -> None:
-    if a2a_backend in {None, "none", "deepep", "gluon_petit"}:
+    if a2a_backend in {None, "none", "deepep", "gluon_petit", "ascend_mc2"}:
         return
     raise NotImplementedError(f"MoE all-to-all backend is unsupported: {a2a_backend}")
 

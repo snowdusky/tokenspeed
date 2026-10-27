@@ -403,3 +403,49 @@ hidden width. Some kernels (Triton MXFP4) return no weights; `MoELayer` then
 returns the precomputed route weights it passed in. FP16 inputs, ROCm builds
 without the fused finalizer, and kernels without deferred finalize keep the
 kernel's own finalized output.
+
+
+## Ascend V4.1 checkpoint experts
+
+`ascend_v41_bf16` expands local MXFP4 experts once at load time.
+`ascend_v41_mxfp4` retains the original E2M1 bytes and group-32 E8M0 scales,
+then expands active experts into temporary BF16 GMM weights per projection.
+Both use the same BF16 GMM, clipped SwiGLU, pre-down route weighting and
+FP32 route summation. The latter trades weight-decoding work for lower
+resident memory; it does not requantize checkpoint values. Device route
+counts control expansion on every native ACL replay. Temporary storage is
+bounded by one gate/up or down projection for at most the number of routes;
+empty experts are omitted without changing the routed row order.
+Packed weight and scale axes are transposed once at load time so expansion
+reads and writes contiguous rows in the GMM layout. Checkpoint values and
+group-32 scales are unchanged; no full BF16 expert copy stays resident.
+
+`ascend_v41_w4a4` also accepts the explicit `ascend_mc2` all-to-all backend
+for TP1 and EP32/64/128. The hierarchy transport carries route IDs and FP32
+weights as raw bits in a 128-byte suffix beside each BF16 activation row.
+The receiving rank recovers contiguous expert rows and applies the route
+weight inside SwiGLU, before the Down projection. Combine consumes the Down
+output directly with unit scales; it must not apply route weights twice.
+Device counts bound FlatQuant and GMM work, including graph capacity tails.
+Ranks pad to the common dispatch capacity with zero-weight rows and discard
+those results after the collective. This backend supports distinct expert IDs
+and rank combine; it does not claim bitwise equivalence to another parallel layout or the
+replicated-row reduction. DeepEP mode overrides and overlap callbacks are
+rejected. The default local-expert provider is unchanged.
+The runtime reserves one dedicated device communicator for MC2. Its persistent
+communication window must not be reused by framework collectives. Target and
+draft experts share this domain: the supported CANN runtime rejects a second
+MC2 domain within the same rank.
+The provider bounds each native dispatch to 16 rows per sender, preserving
+the scheduler's prefill size. Larger bursts can stall the native hierarchy
+under concentrated routing, even with sufficient communication-window memory.
+The rank-consistent row capacity controls the number of collectives; idle
+slices still participate. Splitting does not change token quantization,
+expert selection, or the placement of routing weights before Down.
+MC2 draft experts warm through the complete draft forward. As with DeepEP,
+the separate FlashInfer tactic traversal skips these collective-owning plans.
+Distributed numerical and replay tests cover balanced routes, a changing hot
+owner, and hot experts spread across owners, including idle ranks and chunked
+forwards.
+The production GMM cases exercise both 384-expert Top6 decoder layers and
+128-expert Top3 encoder/draft layers; transport-only tests do not validate GMM.

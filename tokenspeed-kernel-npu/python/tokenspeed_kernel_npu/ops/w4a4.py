@@ -166,7 +166,15 @@ def prepare_flatquant_stage(left, right, clip, *, width: int) -> FlatQuantStage:
 
 
 def prepare_w4a4_moe_weights(
-    w13, w2, scale13, scale2, first, second, *, transposed: bool
+    w13,
+    w2,
+    scale13,
+    scale2,
+    first,
+    second,
+    *,
+    transposed: bool,
+    native_packed_nz: bool = False,
 ) -> W4A4MoePlan:
     """Convert checkpoint INT32 tensors to NZ without changing their INT4 layout.
 
@@ -175,6 +183,10 @@ def prepare_w4a4_moe_weights(
     [E,N,K/8]. The consumer must honor ``transposed`` for BOTH GEMMs.
     Scales remain FP32 [E,N] for fused DSQ, not official-GMM packed UINT64.
     """
+    if type(native_packed_nz) is not bool or (native_packed_nz and not transposed):
+        raise ValueError(
+            "Direct packed NZ requires explicit transposed checkpoint storage"
+        )
     if type(transposed) is not bool:
         raise ValueError("W4A4 transpose selection must be a boolean")
     if (
@@ -232,6 +244,19 @@ def prepare_w4a4_moe_weights(
             )
         if not transposed:
             weight = weight.transpose(1, 2)
+        if native_packed_nz:
+            # This provider targets the validated CANN 9 INT4 format-cast ABI.
+            if weight.shape[1] % 16 or (weight.shape[2] * 8) % 64:
+                raise ValueError(
+                    "INT4 NZ requires storage rows/columns aligned to 16/64"
+                )
+            config = torch.npu.config
+            previous = getattr(config, "allow_internal_format", None)
+            try:
+                config.allow_internal_format = True
+                return torch_npu.npu_format_cast(weight, 29, customize_dtype=3)
+            finally:
+                config.allow_internal_format = previous
         # 910B uses the dedicated INT4 converter: customize_dtype=3 is not
         # supported there. Merge experts along NZ's outer (column-tile) axis
         # so each expert occupies one contiguous physical NZ block.

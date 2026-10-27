@@ -19,3 +19,14 @@
 # SOFTWARE.
 
 """Ascend-specific kernels for TokenSpeed."""
+
+
+def register_torch_compat() -> None:
+    """Supply newer collective names on the Ascend Torch 2.9 stack."""
+    import torch.distributed as dist
+
+    # Direct aliases preserve arguments and asynchronous Work handles.
+    if not hasattr(dist, "all_gather_single"):
+        dist.all_gather_single = dist.all_gather_into_tensor
+    if not hasattr(dist, "reduce_scatter_single"):
+        dist.reduce_scatter_single = dist.reduce_scatter_tensor

@@ -99,7 +99,8 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
             self.layer_id = layer_id
             self.layer_hash_index = layer_id - 37
 
-        def forward(self, hidden, hashes, mask):
+        def forward(self, hidden, hashes, mask, *, global_num_tokens):
+            assert global_num_tokens is None
             events.append(("engram", self.layer_id))
             assert hashes.tolist() == [[self.layer_hash_index] * 3] * 2
             assert mask.tolist() == [True, True]
@@ -120,9 +121,11 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
             ctx,
             *,
             pending_post,
+            token_mask,
             allow_ffn_reduce_fusion,
             capture_input,
         ):
+            assert token_mask.dtype == torch.bool and token_mask.all()
             events.append(("layer", self.layer_id))
             assert allow_ffn_reduce_fusion == (
                 self.layer_id not in (19, 20) and self.layer_id < 36
@@ -149,6 +152,7 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
         engram_max_ngram_size=4,
         engram_n_heads=1,
     )
+    target.model.dp_replicated_rows = False
     target.model.ced_decoder_start = 20
     target.model.decoder_uses_engram = True
     target.model.layers = nn.ModuleList(Layer(i) for i in range(40))
@@ -372,7 +376,7 @@ def test_window_workspace_preserves_deferred_norm():
 
 
 def test_window_workspace_refuses_deferred_norm_off_the_fused_path():
-    # The model defers the SWA norm only to the fused 512-wide CUDA rows; any
+    # The model defers the SWA norm only to the fused 512-wide device rows; any
     # other path must not drop it.
     history = torch.tensor([[-1, -1]])
     backend = _WindowAttention(
@@ -387,7 +391,7 @@ def test_window_workspace_refuses_deferred_norm_off_the_fused_path():
         ),
         torch.zeros(2, dtype=torch.int64),
     )
-    with pytest.raises(ValueError, match="requires 512-wide CUDA rows"):
+    with pytest.raises(ValueError, match="requires 512-wide device rows"):
         backend._workspace(
             torch.randn(2, 64, dtype=torch.bfloat16),
             torch.tensor([0, 1]),
