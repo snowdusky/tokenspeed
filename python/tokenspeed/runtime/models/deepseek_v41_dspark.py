@@ -56,7 +56,6 @@ from tokenspeed.runtime.models.deepseek_v41 import (
     _norm,
     _replicated,
     v41_hc_pre,
-    v41_mxfp8_config,
     v41_quantize_fp8,
 )
 from tokenspeed.runtime.models.deepseek_v41_dspark_heads import DSparkVanillaMarkov
@@ -132,7 +131,7 @@ class _WindowAttention:
         the target writes its own SWA rows.
         """
         batch, block = self.history_slots.shape[0], self.block_size
-        if swa.is_cuda and swa.shape[-1] == 512:
+        if swa.device.type in ("cuda", "npu") and swa.shape[-1] == 512:
             return dsv41.dspark_workspace(
                 swa,
                 swa_norm_weight,
@@ -145,7 +144,7 @@ class _WindowAttention:
                 block,
             )
         if swa_norm_weight is not None:
-            raise ValueError("A deferred SWA norm requires 512-wide CUDA rows")
+            raise ValueError("A deferred SWA norm requires 512-wide device rows")
         history = self.window[self.selection.page, self.selection.row]
         if swa_rope_cache is not None:
             swa = rope_inplace(swa.clone(), positions, swa_rope_cache, None)
@@ -176,7 +175,7 @@ class _WindowAttention:
         kv = self._workspace(
             swa, positions, swa_rope_cache, swa_norm_weight, swa_norm_eps
         )
-        if q.is_cuda and q.shape[-1] == 512:
+        if q.device.type in ("cuda", "npu") and q.shape[-1] == 512:
             out = self._kernel_forward(q, kv, attn_sink, softmax_scale)
         else:
             out = self._reference_forward(q, kv, attn_sink, softmax_scale)
@@ -292,7 +291,7 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
             len(taps) * config.hidden_size,
             config.hidden_size,
             torch.bfloat16,
-            v41_mxfp8_config(quant_config),
+            self.dense_quant_config(quant_config),
             add_prefix("main_proj", prefix),
         )
         self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -303,7 +302,7 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
             config.hidden_size,
             [config.head_dim] * stages,
             torch.bfloat16,
-            v41_mxfp8_config(quant_config),
+            self.dense_quant_config(quant_config),
             add_prefix("context_wkv", prefix),
         )
         # The bigram table is replicated so the block sampler gathers rows
@@ -376,7 +375,7 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
         for stage, layer in enumerate(self.layers):
             window = cache_pool.dspark_kv(stage)
             stage_kv = kv[:, stage * head_dim : (stage + 1) * head_dim]
-            if kv.is_cuda and head_dim == 512:
+            if kv.device.type in ("cuda", "npu") and head_dim == 512:
                 layer.attn.rotary_emb._prepare_cache(kv.device)
                 dsv41.dspark_rows(
                     stage_kv,
@@ -449,6 +448,8 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
 class DeepseekV41ForCausalLMDSpark(DeepseekV41ForCausalLM, TargetCaptureConfigurator):
     """Strict mtp-only adapter sharing embedding/head with its V4.1 target."""
 
+    model_cls = DeepseekV41DSparkModel
+
     def configure_target(self, target_model, target_config) -> None:
         """Install the checkpoint's target taps before draft execution exists."""
         del target_config
@@ -464,7 +465,7 @@ class DeepseekV41ForCausalLMDSpark(DeepseekV41ForCausalLM, TargetCaptureConfigur
         )
 
     def resolve_model(self, config, mapping, quant_config, prefix):
-        return DeepseekV41DSparkModel(
+        return self.model_cls(
             config.text_config,
             mapping,
             quant_config,
@@ -538,6 +539,3 @@ class DeepseekV41ForCausalLMDSpark(DeepseekV41ForCausalLM, TargetCaptureConfigur
                 yield name, tensor
 
         super().load_weights(mapped(), **kwargs)
-
-
-EntryClass = DeepseekV41ForCausalLMDSpark

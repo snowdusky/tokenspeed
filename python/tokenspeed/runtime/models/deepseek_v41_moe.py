@@ -41,14 +41,18 @@ from tokenspeed.runtime.layers.linear import (
 )
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import (
+    ExpertLocationDispatchInfo,
     StandardTopKOutput,
     TopK,
     TopKOutput,
+    record_expert_load,
     simulated_router_logits,
+    topk_ids_logical_to_physical,
 )
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_moe_backend
 from tokenspeed.runtime.layers.quantization import Fp8Config, Mxfp4Config
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.moe.expert_location import get_global_expert_location_metadata
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -119,12 +123,11 @@ class DeepseekV4MLP(nn.Module):
         self.tp_size = tp_size
         self.tp_group = tp_group
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         if x.shape[0] == 0:
             return x.new_empty((0, self.down_proj.output_size))
         gate_up, _ = self.gate_up_proj(x)
-        out, _ = self.down_proj.forward_with_activation(gate_up, self.act_fn)
-        return out
+        return self.down_proj.forward_with_activation(gate_up, self.act_fn)[0]
 
 
 def _random_expert_ids(
@@ -230,8 +233,21 @@ class DeepseekV4TopK(TopK):
 
 def _deepseek_v4_routed_expert_quant_config(
     config: PretrainedConfig,
-    quant_config: QuantizationConfig,
-) -> tuple[QuantizationConfig, bool]:
+    quant_config: QuantizationConfig | None,
+) -> tuple[QuantizationConfig | None, bool]:
+    # Offline-decoded experts retain the original FP4 values in BF16 storage;
+    # the model-wide FP8 configuration still applies to dense projections.
+    if getattr(config, "expert_dtype", None) == "bf16":
+        return None, False
+    if getattr(config, "expert_dtype", None) == "int4":
+        from tokenspeed.runtime.layers.quantization.compressed_tensors.compressed_tensors import (
+            CompressedTensorsConfig,
+        )
+
+        return (
+            CompressedTensorsConfig.from_config(config.expert_quantization_config),
+            False,
+        )
     # ``quant_method=fp8`` describes the model-wide quantization, but DeepSeek
     # V4 can still serialize routed experts as packed MXFP4. Prefer the explicit
     # expert contract so packed FP4 tensors are never allocated as block FP8.
@@ -250,6 +266,12 @@ def _deepseek_v4_routed_expert_quant_config(
 
 
 class DeepseekV4MoE(nn.Module):
+    experts_cls = MoELayer
+    shared_expert_cls = DeepseekV4MLP
+
+    def _placement_enabled(self, backend):
+        return False
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -273,11 +295,12 @@ class DeepseekV4MoE(nn.Module):
         moe_backend = get_moe_backend()
         self.use_mega_moe = moe_backend.is_mega_moe()
         self.use_gluon_petit = moe_backend.is_gluon_petit()
-        self.owns_ep_communication = self.use_mega_moe or self.use_gluon_petit
+        self.owns_ep_communication = self._owns_ep_communication()
         # Petit's VMM-backed collective and auxiliary-stream shared experts do
         # not replay safely together. Keep both branches on the main stream.
         self.stream_fork = StreamFork(None if self.use_gluon_petit else aux_stream)
-        if mapping.moe.ep_size > 1:
+        placement_enabled = self._placement_enabled(moe_backend)
+        if mapping.moe.ep_size > 1 and not placement_enabled:
             if global_server_args_dict.get("enable_eplb", False):
                 raise ValueError(
                     "DeepSeek V4 EP does not support EPLB with precomputed routing."
@@ -290,6 +313,26 @@ class DeepseekV4MoE(nn.Module):
                     "DeepSeek V4 EP requires trivial expert placement with "
                     "precomputed routing."
                 )
+            if not self.use_mega_moe and global_server_args_dict.get(
+                "ep_num_redundant_experts", 0
+            ):
+                raise ValueError(
+                    "DeepSeek V4 normal EP does not support redundant experts "
+                    "with precomputed routing."
+                )
+        self.expert_placement = get_global_expert_location_metadata()
+        if self.expert_placement is not None:
+            # The prepared slot ABI is currently provided by the Ascend W4A4
+            # kernels. Other providers retain their existing placement limit.
+            if not placement_enabled:
+                raise ValueError("V4.1 expert placement requires ascend_v41_w4a4")
+            if self.expert_placement.num_logical_experts != config.n_routed_experts:
+                raise ValueError("V4.1 expert placement has the wrong logical geometry")
+        num_experts = (
+            self.expert_placement.num_physical_experts
+            if self.expert_placement is not None
+            else config.n_routed_experts
+        )
         if self.use_mega_moe:
             if mapping.moe.ep_size <= 1:
                 raise ValueError("DeepSeek V4 MegaMoE requires expert parallelism.")
@@ -305,12 +348,10 @@ class DeepseekV4MoE(nn.Module):
                     "EP size."
                 )
         elif mapping.moe.ep_size > 1:
-            if global_server_args_dict.get("ep_num_redundant_experts", 0):
-                raise ValueError(
-                    "DeepSeek V4 normal EP does not support redundant experts "
-                    "with precomputed routing."
-                )
-            if mapping.attn.tp_size not in (1, mapping.moe.tp_ep_size):
+            if (
+                mapping.attn.tp_size not in (1, mapping.moe.tp_ep_size)
+                and not self._uses_replicated_dp_rows()
+            ):
                 raise ValueError(
                     "DeepSeek V4 normal EP requires attention TP size 1 or "
                     "attention TP size equal to the MoE TPxEP size."
@@ -327,7 +368,7 @@ class DeepseekV4MoE(nn.Module):
         )
 
         if config.n_shared_experts is not None:
-            self.shared_experts = DeepseekV4MLP(
+            self.shared_experts = self.shared_expert_cls(
                 config.hidden_size,
                 config.moe_intermediate_size * config.n_shared_experts,
                 config.hidden_act,
@@ -339,7 +380,7 @@ class DeepseekV4MoE(nn.Module):
                 # Normal EP sums routed and shared partials over the same TPxEP
                 # group. Fused MegaMoE paths return complete routed outputs and
                 # therefore keep the shared expert dense and local.
-                is_shared_expert=not (self.use_mega_moe or self.use_gluon_petit),
+                is_shared_expert=self._shared_expert_ep_sharded(),
             )
         else:
             self.shared_experts = None
@@ -352,12 +393,15 @@ class DeepseekV4MoE(nn.Module):
         routed_quant_config, _ = _deepseek_v4_routed_expert_quant_config(
             config, quant_config
         )
-        self.experts = MoELayer(
+        self.experts = self.experts_cls(
             top_k=config.num_experts_per_tok,
-            num_experts=config.n_routed_experts,
+            num_experts=num_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             quant_config=routed_quant_config,
+            internal_activation_dtype_override=(
+                "int4" if getattr(config, "expert_dtype", None) == "int4" else None
+            ),
             layer_index=layer_index,
             prefix=prefix,
             tp_rank=mapping.moe.tp_rank,
@@ -378,6 +422,16 @@ class DeepseekV4MoE(nn.Module):
                 _deepseek_v4_mega_moe_max_num_tokens() if self.use_mega_moe else None
             ),
         )
+        self.expert_dispatch = (
+            ExpertLocationDispatchInfo.init_new(
+                layer_index,
+                global_server_args_dict["ep_dispatch_algorithm"],
+                self.expert_placement,
+                all_to_all_ep=self.experts.supports_all_to_all_ep,
+            )
+            if self.expert_placement is not None
+            else None
+        )
         self.topk = DeepseekV4TopK(
             top_k=config.num_experts_per_tok,
             renormalize=self._renormalize_routing_weights(),
@@ -387,12 +441,21 @@ class DeepseekV4MoE(nn.Module):
             weights_dtype=self.experts.topk_weights_dtype,
         )
 
+    def _owns_ep_communication(self) -> bool:
+        return self.use_mega_moe or self.use_gluon_petit
+
+    def _shared_expert_ep_sharded(self) -> bool:
+        return not self.owns_ep_communication
+
     def warmup(self) -> None:
         warmup = self.experts.plan.get("warmup")
         if warmup is not None:
             if not self.experts._weights_processed:
                 raise RuntimeError("MoE weights must be processed before warmup")
             warmup(self.experts.plan, self.experts)
+
+    def _uses_replicated_dp_rows(self) -> bool:
+        return False
 
     def _routing_inputs(
         self,
@@ -429,13 +492,27 @@ class DeepseekV4MoE(nn.Module):
         router_logits, correction_bias, hash_indices_table, routing_input_ids = (
             self._routing_inputs(hidden_states, input_ids)
         )
-        return self.topk(
+        output = self.topk(
             hidden_states,
             router_logits,
             routing_correction_bias=correction_bias,
             hash_indices_table=hash_indices_table,
             input_ids=routing_input_ids,
         )
+        return self._map_topk_output(output)
+
+    def _map_topk_output(self, output: TopKOutput) -> TopKOutput:
+        if self.expert_dispatch is None:
+            return output
+        ids = topk_ids_logical_to_physical(
+            output.topk_ids, self.expert_dispatch, self.config.n_routed_experts
+        )
+        record_expert_load(self.expert_dispatch.load, ids)
+        return StandardTopKOutput(output.topk_weights, ids, output.router_logits)
+
+    def get_moe_routed_weights(self):
+        """Prepared per-slot storage; includes encoded scales read by the kernel."""
+        return self.experts.plan["expert_slot_tensors"]()
 
     def _forward_routed_experts(
         self,
@@ -512,7 +589,7 @@ class DeepseekV4MoE(nn.Module):
 
         The following all-reduce can read this memory in place.
         """
-        if hidden_states.shape[0] == 0 and not self.use_gluon_petit:
+        if hidden_states.shape[0] == 0 and not self.owns_ep_communication:
             return hidden_states if out is None else out.copy_(hidden_states)
         with nvtx_range("moe_select_experts"):
             topk_output = self._compute_topk_output(hidden_states, input_ids)

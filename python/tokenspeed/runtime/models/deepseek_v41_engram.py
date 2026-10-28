@@ -352,8 +352,7 @@ def resolve_engram_host_layout(host_table: bool, tp_size: int) -> str:
     if requested in ("shared", "sharded"):
         return requested
     raise ValueError(
-        "engram_host_table_layout must be auto, shared, or sharded; "
-        f"got {requested!r}"
+        f"engram_host_table_layout must be auto, shared, or sharded; got {requested!r}"
     )
 
 
@@ -457,6 +456,8 @@ def _dequant_fp8_e8m0(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor
 class RowShardedEngramEmbedding(nn.Module):
     """FP8 codes and raw E8M0 scale bytes, GPU-sharded or host-resident."""
 
+    device_weight_dtype = torch.float8_e4m3fn
+
     def __init__(
         self,
         num_embeddings: int,
@@ -487,10 +488,12 @@ class RowShardedEngramEmbedding(nn.Module):
         self.embedding_dim = embedding_dim
         self.tp_group = mapping.attn.tp_group
         self.host_table = host_table
+        self.compute_device = torch.device(device)
         self.host_layout = host_layout
         self.layer_id = layer_id
         self._mmap_keep: list[object] = []
         self._host_gpu_registered = False
+        self._host_lookup = None
         row_sharded = (not host_table) or host_layout == "sharded"
         if row_sharded:
             self.part_num_embeddings = (
@@ -553,7 +556,7 @@ class RowShardedEngramEmbedding(nn.Module):
                 torch.empty(
                     self.part_num_embeddings,
                     embedding_dim,
-                    dtype=torch.float8_e4m3fn,
+                    dtype=self.device_weight_dtype,
                     device=device,
                 ),
                 requires_grad=False,
@@ -583,10 +586,7 @@ class RowShardedEngramEmbedding(nn.Module):
         """cudaHostRegister once. Gather kernels must not register."""
         if self._host_gpu_registered or not self.host_table:
             return
-        if (
-            torch.device(self.weight.device).type != "cpu"
-            or not torch.cuda.is_available()
-        ):
+        if self.compute_device.type != "cuda" or not torch.cuda.is_available():
             self._host_gpu_registered = True
             return
         platform = current_platform()
@@ -613,6 +613,8 @@ class RowShardedEngramEmbedding(nn.Module):
             rows = rows.view(torch.uint8)
         elif rows.dtype != torch.float8_e4m3fn:
             raise TypeError("Engram table weights must stay FP8 E4M3")
+        if param.dtype == torch.uint8:
+            rows = rows.view(torch.uint8)
         param.data[local_start : local_start + rows.shape[0]].copy_(rows)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
@@ -673,7 +675,26 @@ class RowShardedEngramEmbedding(nn.Module):
         only local rows and reduce. Dequantization uses the same FP8/E8M0
         torch casts in both paths.
         """
-        if indices.is_cuda and not self.host_table:
+        values = self._lookup(indices)
+        if len(self.tp_group) > 1 and self.host_layout != "shared":
+            # The workspace all-reduce sizes itself on rows x trailing width.
+            # Reduce one row per token, [rows, columns * head_dim]: the lane is
+            # widened for that at construction (DeepseekV41Engram), so a
+            # decode batch stays inside the one-shot window. As
+            # [rows * columns, head_dim] the same bytes exceed the window's
+            # row capacity and drop to NCCL, which costs a ring latency plus a
+            # launch stall on every step.
+            flat = values.reshape(-1, values.shape[-2] * values.shape[-1])
+            values = all_reduce(
+                flat,
+                group=self.tp_group,
+                backend=None,
+                op=torch.distributed.ReduceOp.SUM,
+            ).view(values.shape)
+        return values
+
+    def _lookup(self, indices):
+        if indices.device.type in ("cuda", "npu") and not self.host_table:
             from tokenspeed_kernel.ops.embedding import mxfp8_embedding
 
             # Each layer's 2D hash slice can be gathered directly; retain the
@@ -703,21 +724,6 @@ class RowShardedEngramEmbedding(nn.Module):
                     self.weight.view(torch.uint8)[local_ids], self.scale[local_ids]
                 )
             values = values.masked_fill(~local.unsqueeze(-1), 0)
-        if len(self.tp_group) > 1 and self.host_layout != "shared":
-            # The workspace all-reduce sizes itself on rows x trailing width.
-            # Reduce one row per token, [rows, columns * head_dim]: the lane is
-            # widened for that at construction (DeepseekV41Engram), so a
-            # decode batch stays inside the one-shot window. As
-            # [rows * columns, head_dim] the same bytes exceed the window's
-            # row capacity and drop to NCCL, which costs a ring latency plus a
-            # launch stall on every step.
-            flat = values.reshape(-1, values.shape[-2] * values.shape[-1])
-            values = all_reduce(
-                flat,
-                group=self.tp_group,
-                backend=None,
-                op=torch.distributed.ReduceOp.SUM,
-            ).view(values.shape)
         return values
 
 
@@ -734,6 +740,8 @@ def engram_reduce_lane_width(layout: EngramLayout) -> int:
 
 class DeepseekV41Engram(nn.Module):
     """Reference normalized-dot, signed-sqrt gate over four hyperconnection copies."""
+
+    embedding_cls = RowShardedEngramEmbedding
 
     def __init__(
         self,
@@ -754,6 +762,15 @@ class DeepseekV41Engram(nn.Module):
         """
         super().__init__()
         layout = EngramLayout.from_config(config)
+        table_mapping, self.row_exchange = self._table_mapping(
+            mapping, device, host_table
+        )
+        # These tables are consulted before CED narrowing, where the scheduler's
+        # global input row counts apply to both eager and captured execution.
+        if self.row_exchange is not None and any(
+            i >= config.candidate_source_layer_id for i in config.engram_layer_ids
+        ):
+            raise ValueError("Shared Engram table rows must precede CED narrowing")
         if config.hc_mult != 4:
             raise ValueError("V4.1 Engram requires four hyperconnection copies")
         self.layer_id = layer_id
@@ -797,10 +814,10 @@ class DeepseekV41Engram(nn.Module):
             raise ValueError(
                 "Do not exclude Engram wkv from checkpoint FP8 quantization"
             )
-        self.embed = RowShardedEngramEmbedding(
+        self.embed = self.embedding_cls(
             layout.num_embeddings[self.layer_hash_index],
             layout.head_dim,
-            mapping,
+            table_mapping,
             device,
             host_table,
             host_layout,
@@ -852,6 +869,8 @@ class DeepseekV41Engram(nn.Module):
         hidden_states: torch.Tensor,
         hash_ids: torch.Tensor,
         token_mask: torch.Tensor,
+        *,
+        global_num_tokens: list[int] | None,
     ) -> torch.Tensor:
         """Inject Engram into [..., 4, hidden_size], returning the same shape/dtype.
 
@@ -868,9 +887,18 @@ class DeepseekV41Engram(nn.Module):
             raise ValueError("Engram hidden states, hashes and mask shapes disagree")
         if token_mask.dtype != torch.bool:
             raise TypeError("Engram token mask must be bool")
+        if hidden_states.numel() == 0 and self.row_exchange is None:
+            return hidden_states
+        local_rows = hash_ids.shape[0]
+        offset = 0
+        if self.row_exchange is not None:
+            hash_ids, offset = self.row_exchange.gather(hash_ids, global_num_tokens)
+        embeddings = self.embed(hash_ids)
+        if self.row_exchange is not None:
+            embeddings = embeddings[offset : offset + local_rows]
         if hidden_states.numel() == 0:
             return hidden_states
-        embeddings = self.embed(hash_ids).flatten(-2)
+        embeddings = embeddings.flatten(-2)
         kv, _ = self.wkv(embeddings, block_scale=None, output_dtype=None)
         if hidden_states.is_cuda:
             from tokenspeed_kernel.ops.residual import normalized_dot_gate
@@ -886,8 +914,19 @@ class DeepseekV41Engram(nn.Module):
             key.square().mean(-1) + self.eps
         )
         dot = (h * weight * key).sum(-1) * rstd * self.dim**-0.5
-        gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
+        magnitude = dot.abs().clamp_min(1e-6).sqrt()
+        signed = self._signed_magnitude(dot, magnitude)
+        gate = torch.sigmoid(signed)
         gate = gate.masked_fill(~token_mask.unsqueeze(-1), 0)
         return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(
             hidden_states.dtype
         )
+
+    def _table_mapping(self, mapping, device, host_table):
+        requested = global_server_args_dict["engram_tp_size"]
+        if requested not in (None, mapping.attn.tp_size):
+            raise ValueError("Wider Engram tables require the Ascend implementation")
+        return mapping, None
+
+    def _signed_magnitude(self, dot, magnitude):
+        return torch.copysign(magnitude, dot)

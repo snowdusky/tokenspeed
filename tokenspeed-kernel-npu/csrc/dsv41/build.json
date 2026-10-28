@@ -1,0 +1,72 @@
+[
+  {
+    "source": "attention_codec_bits.asc",
+    "output": "python/tokenspeed_kernel_npu/ops/_v41/libattention_codec_bits_h16.so",
+    "defines": [
+      "V41_HEAD_CAPACITY=16"
+    ]
+  },
+  {
+    "source": "attention_codec_bits.asc",
+    "output": "python/tokenspeed_kernel_npu/ops/_v41/libattention_codec_bits_h64.so",
+    "defines": [
+      "V41_HEAD_CAPACITY=64"
+    ]
+  },
+  {
+    "source": "index_metadata.asc",
+    "output": "python/tokenspeed_kernel_npu/ops/_v41/libindex_metadata.so"
+  },
+  {
+    "source": "mhc_post_native.asc",
+    "output": "python/tokenspeed_kernel_npu/ops/_v41/libmhc_post.so"
+  },
+  {
+    "source": "global_pack_native.asc",
+    "output": "python/tokenspeed_kernel_npu/ops/_v41/libglobal_pack.so"
+  },
+  {
+    "source": "global_slots_native.asc",
+    "output": "python/tokenspeed_kernel_npu/ops/_v41/libglobal_slots.so"
+  },
+  {
+    "source": "index_pack_native.asc",
+    "output": "python/tokenspeed_kernel_npu/ops/_v41/libindex_pack.so"
+  },
+  {
+    "source": "index_query_qdq.asc",
+    "output": "python/tokenspeed_kernel_npu/ops/_v41/libindex_query.so"
+  },
+  {
+    "source": "index_scan_reduction.asc",
+    "output": "python/tokenspeed_kernel_npu/ops/_v41/libindex_scan_reduction.so"
+  },
+  {
+    "source": "index_selection_native.asc",
+    "output": "python/tokenspeed_kernel_npu/ops/_v41/libindex_selection.so"
+  },
+  {
+    "source": "swa_pack_native.asc",
+    "output": "python/tokenspeed_kernel_npu/ops/_v41/libswa_pack.so"
+  },
+  {
+    "source": "rope_native.asc",
+    "output": "python/tokenspeed_kernel_npu/ops/_v41/librope.so"
+  },
+  {
+    "source": "ngram_prefix_native.asc",
+    "output": "python/tokenspeed_kernel_npu/ops/libngram_prefix.so"
+  },
+  {
+    "source": "shared_swiglu_general.asc",
+    "output": "python/tokenspeed_kernel_npu/ops/libshared_swiglu_general.so"
+  },
+  {
+    "source": "grouped_w4a4.asc",
+    "output": "python/tokenspeed_kernel_npu/ops/libgrouped_w4a4.so"
+  },
+  {
+    "source": "host_mxfp8.asc",
+    "output": "python/tokenspeed_kernel_npu/ops/libgather_fp8_fused.so"
+  }
+]

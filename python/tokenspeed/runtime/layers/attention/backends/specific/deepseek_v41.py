@@ -1249,6 +1249,22 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         source = self.spec.index_sources[layer_id]
         group = self.spec.indexer_query_group
         total = positions.numel()
+        # NPU index heads are replicated. Split independent query rows through
+        # the existing QCP path; keep the score's head-reduction semantics.
+        if positions.device.type == "npu":
+            if (
+                forward_mode.is_mixed()
+                or index_process_group is not None
+                or self.kvp_size != 1
+                or owner < 0
+                or layer_id != source
+                or len(group) <= 1
+                or total == 0
+            ):
+                return None
+            return InterleavedQueryPlan(
+                total_rows=total, rank=self.spec.indexer_query_rank, size=len(group)
+            )
         if (
             forward_mode.is_mixed()
             or not forward_mode.is_extend()
@@ -1413,8 +1429,12 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             table = table[:, : max(0, index_cache.shape[0] - 1)]
         candidate_capacity = min(self.spec.candidate_topk, table.shape[1] * 8)
         n = positions.numel()
-        partition = self.plan_indexer_queries(
-            layer_id, positions, request_indices, forward_mode, index_process_group
+        partition = (
+            self.plan_indexer_queries(
+                layer_id, positions, request_indices, forward_mode, index_process_group
+            )
+            if index_q is not None
+            else None
         )
         scoring_positions = positions
         scoring_requests = request_indices
@@ -1465,6 +1485,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         # Query tiling bounds both score scratch and replicated table rows. Do
         # not index_select the table for the entire prefill (T * context pages).
         canonical_prefill = window is not None
+        window_rows = partition.total_rows if partition is not None else n
         query_tile = 1024 if canonical_prefill else 256
         windows = (
             [
@@ -1474,8 +1495,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             ]
             if canonical_prefill or kvp_decode
             else [
-                (start, min(start + query_tile, n), None)
-                for start in range(0, n, query_tile)
+                (start, min(start + query_tile, window_rows), None)
+                for start in range(0, window_rows, query_tile)
             ]
         )
         if partition is not None:
@@ -1569,9 +1590,19 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             cb = None
             if reindex and selection_kind == "candidates":
                 if same_candidate_rows:
-                    cb = candidates.block_ids[start:stop]
+                    candidate_rows = (
+                        candidates.block_ids[partition.local_slice]
+                        if partition is not None
+                        else candidates.block_ids
+                    )
+                    cb = candidate_rows[start:stop]
                 else:
-                    ci = candidate_index[start:stop]
+                    candidate_rows = (
+                        candidate_index[partition.local_slice]
+                        if partition is not None
+                        else candidate_index
+                    )
+                    ci = candidate_rows[start:stop]
                     cb = candidates.block_ids[ci.clamp_min(0)].masked_fill(
                         ci[:, None] < 0, -1
                     )
@@ -1622,7 +1653,16 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             )
             del scoring_cache
         if partition is not None:
-            rows, lens = partition.gather_selection(rows, lens, query_group)
+            if produce_candidates:
+                # Exchange row and block selections together, including ranks
+                # with no queries, then restore canonical request order.
+                packed = torch.cat((rows, blocks, block_lens[:, None]), dim=1)
+                packed, lens = partition.gather_selection(packed, lens, query_group)
+                rows = packed[:, : self.spec.index_topk].contiguous()
+                blocks = packed[:, self.spec.index_topk : -1].contiguous()
+                block_lens = packed[:, -1].contiguous()
+            else:
+                rows, lens = partition.gather_selection(rows, lens, query_group)
         if produce_candidates:
             candidates = V41Candidates(positions, request_indices, blocks, block_lens)
         slots = self.global_read_slots(

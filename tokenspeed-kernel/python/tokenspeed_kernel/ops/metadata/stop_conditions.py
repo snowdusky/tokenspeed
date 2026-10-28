@@ -71,6 +71,8 @@ def _apply_stop_conditions_kernel(
     row_mask = rows < batch_size
     slots = tl.load(req_pool_indices_ptr + rows, mask=row_mask, other=padding_index)
     live = row_mask & (slots != padding_index)
+    slots = tl.where(live, slots, 0)
+    row_offsets = tl.where(row_mask, rows, 0)
     is_extend = rows < num_extends
     valid = tl.load(valid_cache_lengths_ptr + slots, mask=live, other=0)
     limits = tl.load(token_limits_ptr + slots, mask=live, other=0)
@@ -87,7 +89,8 @@ def _apply_stop_conditions_kernel(
     has_output = live & (~is_extend | (rows < num_prefill_outputs))
     token_mask = has_output[:, None] & (columns[None, :] < width[:, None])
     tokens = tl.load(
-        output_tokens_ptr + first_token[:, None] + columns[None, :],
+        output_tokens_ptr
+        + tl.where(token_mask, first_token[:, None] + columns[None, :], 0),
         mask=token_mask,
         other=-1,
     )
@@ -99,9 +102,11 @@ def _apply_stop_conditions_kernel(
         is_stop = is_stop | ((tokens == stop_id[:, None]) & (stop_id[:, None] >= 0))
 
     # Extend rows: only the chunk that completes the prompt owes a token.
-    input_lengths = tl.load(input_lengths_ptr + rows, mask=row_mask, other=0)
+    input_lengths = tl.load(input_lengths_ptr + row_offsets, mask=row_mask, other=0)
     prompt_lengths = tl.load(
-        prompt_lengths_ptr + rows, mask=row_mask & is_extend, other=-1
+        prompt_lengths_ptr + tl.where(row_mask & is_extend, rows, 0),
+        mask=row_mask & is_extend,
+        other=-1,
     )
     completes_prompt = valid + input_lengths == prompt_lengths
     extend_stops = (
@@ -112,7 +117,9 @@ def _apply_stop_conditions_kernel(
 
     # Decode rows: keep through the first accepted stop token and within the
     # budget, nothing once the request has stopped.
-    accepted = tl.load(accept_lengths_ptr + rows, mask=row_mask, other=0).to(tl.int32)
+    accepted = tl.load(accept_lengths_ptr + row_offsets, mask=row_mask, other=0).to(
+        tl.int32
+    )
     first_stop = tl.min(
         tl.where(
             is_stop & (columns[None, :] < accepted[:, None]),

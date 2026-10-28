@@ -28,6 +28,7 @@ from tokenspeed_kernel.signature import (
 )
 
 __all__ = [
+    "dequantize_mxfp_weight",
     "quantize_fp8",
     "quantize_fp8_with_gate",
     "quantize_fp8_with_scale",
@@ -41,6 +42,43 @@ __all__ = [
     "rmsnorm_quantize_fp8_group32",
     "silu_and_mul_quantize_fp8_group32",
 ]
+
+
+def dequantize_mxfp_weight(
+    weight: torch.Tensor,
+    scales: torch.Tensor,
+    *,
+    bits: int,
+    block_size: tuple[int, int],
+) -> torch.Tensor:
+    """Expand checkpoint E4M3 or packed E2M1 weights with E8M0 scales to BF16.
+
+    weight is uint8 [N,K] for bits=8 or [N,K/2] for bits=4 (low nibble first).
+    scales is colocated uint8 [ceil(N/block_n),ceil(K/block_k)]. block_size
+    explicitly selects the checkpoint scale grouping. Neither input is modified.
+    """
+    if bits not in (4, 8) or len(block_size) != 2 or min(block_size) < 1:
+        raise ValueError("MXFP weights require bits=4/8 and a positive 2D block size")
+    if weight.dtype != torch.uint8 or weight.ndim != 2:
+        raise ValueError("MXFP weights must be a uint8 matrix")
+    n, packed_k = weight.shape
+    k = packed_k * (8 // bits)
+    bn, bk = block_size
+    if (
+        scales.dtype != torch.uint8
+        or scales.device != weight.device
+        or scales.shape != ((n + bn - 1) // bn, (k + bk - 1) // bk)
+    ):
+        raise ValueError("MXFP scale shape, dtype or device does not match the weight")
+    kernel = select_kernel(
+        "quantization",
+        "dequantize_mxfp_weight",
+        format_signature(weight=dense_tensor_format(weight.dtype)),
+        traits=None,
+        override=None,
+        solution=None,
+    )
+    return kernel(weight, scales, bits, block_size)
 
 
 def rmsnorm_mxfp4_quant(
@@ -873,6 +911,7 @@ def rmsnorm_nvfp4_quant(
 
 
 # Backend registration (side-effect imports).
+import tokenspeed_kernel.ops.quantization.ascend  # noqa: E402,F401
 import tokenspeed_kernel.ops.quantization.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.quantization.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.quantization.triton  # noqa: E402,F401
