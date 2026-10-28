@@ -465,7 +465,7 @@ def test_decoder_layer_requires_explicit_forward_mode():
 def test_empty_decoder_rows_complete_hc_and_preserve_ep_participation(
     monkeypatch, tokens, owns_ep
 ):
-    monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
+    monkeypatch.setattr(v41.DeepseekV41DecoderLayer, "moe_cls", _DenseFFN)
     config = _config()
     layer = DeepseekV41DecoderLayer(
         config, _mapping(0, 1, 1), 0, 0, None, "layers.0", None, None, False, "gpu"
@@ -557,7 +557,7 @@ def test_idle_model_calls_every_ep_layer_with_completed_empty_state(
     from tokenspeed.runtime.models import deepseek_v41_engram as engram
     from tokenspeed.runtime.models.deepseek_v41_parallel import EngramRowExchange
 
-    monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
+    monkeypatch.setattr(v41.DeepseekV41DecoderLayer, "moe_cls", _DenseFFN)
     config = _config()
     if not shared_engram:
         config.engram_layer_ids = []
@@ -628,7 +628,7 @@ def test_idle_model_calls_every_ep_layer_with_completed_empty_state(
 
 @pytest.mark.parametrize("attention_dp", [False, True])
 def test_cache_only_narrowing_handoff_has_no_pending_hc(monkeypatch, attention_dp):
-    monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
+    monkeypatch.setattr(v41.DeepseekV41DecoderLayer, "moe_cls", _DenseFFN)
     config = _config()
     config.engram_layer_ids = []
     model = DeepseekV41Model(config, _mapping(0, 1, 1), None, "model", False, "gpu")
@@ -913,7 +913,7 @@ def test_attention_reduction_precedes_hc_join_unless_fusible(
     monkeypatch, tp_size, can_fuse, fusion_error, narrow, mode
 ):
     """Record the stream-join boundary while running real CPU layer arithmetic."""
-    monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
+    monkeypatch.setattr(v41.DeepseekV41DecoderLayer, "moe_cls", _DenseFFN)
     torch.manual_seed(41)
     config = _config()
     mapping = _mapping(0, tp_size, tp_size)
@@ -1027,7 +1027,7 @@ def test_attention_reduction_precedes_hc_join_unless_fusible(
 def test_shifted_mhc_consumes_reduced_rows_and_reuses_ffn_mixes(
     monkeypatch, tokens, kept, supported
 ):
-    monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
+    monkeypatch.setattr(v41.DeepseekV41DecoderLayer, "moe_cls", _DenseFFN)
     torch.manual_seed(41)
     config = _config()
     mapping = _mapping(0, 2, 2)
@@ -1309,7 +1309,7 @@ def test_shifted_mhc_gpu_layer_matches_fallback(
 
 
 def test_single_pass_two_layer_chain_and_comb_orientation(monkeypatch):
-    monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
+    monkeypatch.setattr(v41.DeepseekV41DecoderLayer, "moe_cls", _DenseFFN)
     config = _config()
     config.engram_layer_ids = []
     positions = torch.arange(3)
@@ -1403,7 +1403,7 @@ def test_single_pass_two_layer_chain_and_comb_orientation(monkeypatch):
     "mode", [ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.MIXED]
 )
 def test_cross_layer_reduction_uses_consumer_norm(monkeypatch, fusion, mode):
-    monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
+    monkeypatch.setattr(v41.DeepseekV41DecoderLayer, "moe_cls", _DenseFFN)
     torch.manual_seed(91)
     config = _config()
     layers = [
@@ -1522,7 +1522,7 @@ def test_cross_layer_reduction_uses_consumer_norm(monkeypatch, fusion, mode):
 def test_cross_layer_chain_preserves_engram_taps_and_stage_handoffs(
     monkeypatch, mode, narrow
 ):
-    monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
+    monkeypatch.setattr(v41.DeepseekV41DecoderLayer, "moe_cls", _DenseFFN)
     torch.manual_seed(91)
     config = _config()
     model = v41.DeepseekV41Model(config, _mapping(0, 1, 1), None, "model", False, "gpu")
@@ -1717,7 +1717,7 @@ def test_attention_owner_cast_index_and_grouped_output(layer_id):
 
 
 def test_full_40_layer_backbone_engram_and_final_mix(monkeypatch):
-    monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
+    monkeypatch.setattr(v41.DeepseekV41DecoderLayer, "moe_cls", _DenseFFN)
     torch.manual_seed(7)
     config = _config()
     model = DeepseekV41Model(config, _mapping(0, 1, 1), None, "model", False, "gpu")
@@ -1791,7 +1791,7 @@ def test_decoder_narrowing_projects_global_from_all_rows_then_runs_the_tail(
     writes its global KV for every row and then narrows to the decoder view;
     every later layer, its collectives and the DSpark taps run on the view;
     the sampled rows are the view's logits rows."""
-    monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
+    monkeypatch.setattr(v41.DeepseekV41DecoderLayer, "moe_cls", _DenseFFN)
     torch.manual_seed(7)
     config = _config()
     model = DeepseekV41Model(config, _mapping(0, 1, 1), None, "model", False, "gpu")
@@ -1902,7 +1902,7 @@ def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
     from tokenspeed.runtime.execution.breakable_cuda_graph import active_forward
     from tokenspeed.runtime.execution.prefill_graph import NarrowingPrefillModel
 
-    monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
+    monkeypatch.setattr(v41.DeepseekV41DecoderLayer, "moe_cls", _DenseFFN)
     torch.manual_seed(7)
     config = _config()
     model = DeepseekV41Model(config, _mapping(0, 1, 1), None, "model", False, "gpu")
@@ -3713,22 +3713,3 @@ def test_non_ascend_moe_keeps_placement_restrictions(
     monkeypatch.setitem(global_server_args_dict, setting, value)
     with torch.device("meta"), pytest.raises(ValueError, match=message):
         v4.DeepseekV4MoE(_config(), _mapping(0, 4, 4), _quant(), 0, "ffn", None)
-
-
-@pytest.mark.skipif(
-    not current_platform().is_npu, reason="requires Ascend model planning"
-)
-def test_v41_mc2_binds_its_expert_communicator(monkeypatch):
-    from tokenspeed.runtime.layers.moe import utils as moe_utils
-
-    mapping = _mapping(0, 4, 4)
-    _mock_loader_hardware(monkeypatch, mapping)
-    monkeypatch.setattr(
-        moe_utils, "ALL2ALL_BACKEND", moe_utils.All2AllBackend.ASCEND_MC2
-    )
-    group = Mock(spec=torch.distributed.ProcessGroup)
-    monkeypatch.setattr(pg_manager, "get_dedicated_device_group", lambda *args: group)
-    with torch.device("meta"):
-        moe = v41.DeepseekV41MoE(_config(), mapping, _quant(), 0, "ffn", None)
-    assert moe.experts.plan["process_group"] is group
-    assert moe.owns_ep_communication

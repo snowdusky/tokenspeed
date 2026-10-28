@@ -4,6 +4,14 @@ This recipe uses eight Ascend devices, FlatQuant W4A4 experts, BF16 dense
 layers, packed KV caches, host-resident FP8 Engram tables and DSpark. Select
 TP1/DP8, TP2/DP4 or TP8/DP1 explicitly; all three use EP8.
 
+Model registration selects `deepseek_v41_ascend910.py` for both the target and
+DSpark on Ascend. It shares checkpoint loading and the CED/DSpark forward
+protocols with the common model. Device weight layouts, expert execution,
+Engram lookup and communication preparation live in the Ascend components.
+Experts use the existing kernel plans and checkpoint loaders; complete model
+warmup and decode capture prepare their collective geometry. Prefill remains
+eager in this recipe.
+
 The TP8 recipe explicitly selects FP32 accumulation for BF16 reductions and
 AIV transport for reductions and gathers up to 2 MiB. The same policy supports
 aligned, contiguous TP2 and TP4 groups within one node. Larger messages keep

@@ -39,7 +39,6 @@ from types import SimpleNamespace
 import torch
 from tokenspeed_kernel.ops.attention import dsv41
 from tokenspeed_kernel.ops.attention.dsv41 import rope_inplace
-from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32
 from torch import nn
 
 from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
@@ -57,7 +56,6 @@ from tokenspeed.runtime.models.deepseek_v41 import (
     _norm,
     _replicated,
     v41_hc_pre,
-    v41_mxfp8_config,
     v41_quantize_fp8,
 )
 from tokenspeed.runtime.models.deepseek_v41_dspark_heads import DSparkVanillaMarkov
@@ -247,8 +245,6 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
         flat = hidden_states.reshape(-1, hidden_states.shape[-1])
         if flat.is_cuda:
             logits = torch.mm(flat, head.T, out_dtype=torch.float32)
-        elif flat.device.type == "npu":
-            logits = dsv4_linear_fp32(flat, head)
         else:
             logits = flat.float() @ head.float().T
         return logits.view(*hidden_states.shape[:-1], head.shape[0])
@@ -295,7 +291,7 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
             len(taps) * config.hidden_size,
             config.hidden_size,
             torch.bfloat16,
-            v41_mxfp8_config(quant_config),
+            self.dense_quant_config(quant_config),
             add_prefix("main_proj", prefix),
         )
         self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -306,7 +302,7 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
             config.hidden_size,
             [config.head_dim] * stages,
             torch.bfloat16,
-            v41_mxfp8_config(quant_config),
+            self.dense_quant_config(quant_config),
             add_prefix("context_wkv", prefix),
         )
         # The bigram table is replicated so the block sampler gathers rows
@@ -452,6 +448,8 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
 class DeepseekV41ForCausalLMDSpark(DeepseekV41ForCausalLM, TargetCaptureConfigurator):
     """Strict mtp-only adapter sharing embedding/head with its V4.1 target."""
 
+    model_cls = DeepseekV41DSparkModel
+
     def configure_target(self, target_model, target_config) -> None:
         """Install the checkpoint's target taps before draft execution exists."""
         del target_config
@@ -467,7 +465,7 @@ class DeepseekV41ForCausalLMDSpark(DeepseekV41ForCausalLM, TargetCaptureConfigur
         )
 
     def resolve_model(self, config, mapping, quant_config, prefix):
-        return DeepseekV41DSparkModel(
+        return self.model_cls(
             config.text_config,
             mapping,
             quant_config,
@@ -541,6 +539,3 @@ class DeepseekV41ForCausalLMDSpark(DeepseekV41ForCausalLM, TargetCaptureConfigur
                 yield name, tensor
 
         super().load_weights(mapped(), **kwargs)
-
-
-EntryClass = DeepseekV41ForCausalLMDSpark

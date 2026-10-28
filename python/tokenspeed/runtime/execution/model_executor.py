@@ -1181,7 +1181,7 @@ class ModelExecutor:
             # All-to-all and MegaMoE plans own collectives sized by the real
             # batch geometry; they have no FlashInfer tactics to tune either.
             if (
-                layer.plan["a2a_backend"] in ("deepep", "ascend_mc2")
+                layer.plan["a2a_backend"] == "deepep"
                 or layer.plan["solution"] == "mega_moe"
             ):
                 continue

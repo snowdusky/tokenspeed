@@ -35,8 +35,12 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.linear import LinearBase
 from tokenspeed.runtime.layers.moe import utils
-from tokenspeed.runtime.layers.moe.expert import MoELayer
-from tokenspeed.runtime.models.deepseek_v41 import DeepseekV41Model
+from tokenspeed.runtime.models.deepseek_v41_ascend910 import (
+    Ascend910Experts,
+)
+from tokenspeed.runtime.models.deepseek_v41_ascend910 import (
+    Ascend910Model as DeepseekV41Model,
+)
 
 pytestmark = pytest.mark.skipif(not current_platform().is_npu, reason="requires Ascend")
 
@@ -75,7 +79,7 @@ def test_backbone_prefill_and_live_decode_acl_replay(tmp_path):
     for module in model.modules():
         if isinstance(module, LinearBase):
             module.quant_method.process_weights_after_loading(module)
-        if isinstance(module, MoELayer):
+        if isinstance(module, Ascend910Experts):
             module.process_weights_after_loading(module)
 
     arena = backend.cache_pool.arena.buffer

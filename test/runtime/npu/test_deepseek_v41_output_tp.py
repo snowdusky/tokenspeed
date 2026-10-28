@@ -33,7 +33,9 @@ from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.models.deepseek_v41 import DeepseekV41Attention
+from tokenspeed.runtime.models.deepseek_v41_ascend910 import (
+    Ascend910Attention as DeepseekV41Attention,
+)
 
 pytestmark = pytest.mark.skipif(not current_platform().is_npu, reason="requires Ascend")
 

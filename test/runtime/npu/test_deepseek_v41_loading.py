@@ -28,7 +28,9 @@ from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.models.deepseek_v41 import (
     _merged,
     _replicated,
-    v41_mxfp8_config,
+)
+from tokenspeed.runtime.models.deepseek_v41_ascend910 import (
+    dense_quant_config as v41_mxfp8_config,
 )
 
 pytestmark = pytest.mark.skipif(not current_platform().is_npu, reason="requires Ascend")
@@ -129,14 +131,17 @@ def test_fp8_row_shard_crossing_scale_block(tp_size, tp_rank):
     )
 
 
+@pytest.mark.parametrize("model_owned", [False, True])
 @pytest.mark.parametrize("rows", [1, 8, 32])
 @pytest.mark.parametrize("backend", ["ascend_v41_bf16", "ascend_v41_mxfp4"])
 @pytest.mark.parametrize("ep_size", [1, 2])
-def test_mxfp4_moe_load_and_acl_replay(rows, backend, ep_size):
+def test_mxfp4_moe_load_and_acl_replay(rows, backend, ep_size, model_owned):
     from tokenspeed.runtime.layers.moe import utils
     from tokenspeed.runtime.layers.moe.expert import MoELayer
     from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput
     from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
+    from tokenspeed.runtime.models.deepseek_v41_ascend910 import Ascend910Experts
+    from tokenspeed.runtime.moe.expert_location_updater import _all_to_all_ep
 
     previous = utils.MOE_BACKEND
     utils.MOE_BACKEND = utils.MoeBackend(backend)
@@ -146,7 +151,7 @@ def test_mxfp4_moe_load_and_acl_replay(rows, backend, ep_size):
                 previous_dtype = torch.get_default_dtype()
                 torch.set_default_dtype(torch.bfloat16)
                 try:
-                    layer = MoELayer(
+                    layer = (Ascend910Experts if model_owned else MoELayer)(
                         top_k=2,
                         num_experts=4,
                         hidden_size=256,
@@ -161,7 +166,12 @@ def test_mxfp4_moe_load_and_acl_replay(rows, backend, ep_size):
                         activation="swiglu",
                         swiglu_limit=7.0,
                         routing_mode="precomputed_topk",
+                        routing_config={},
+                        internal_activation_dtype_override=None,
+                        persistent_max_num_tokens_per_gpu=None,
+                        with_bias=False,
                     )
+                    assert not _all_to_all_ep(torch.nn.Sequential(layer))
                 finally:
                     torch.set_default_dtype(previous_dtype)
     finally:
@@ -202,7 +212,13 @@ def test_mxfp4_moe_load_and_acl_replay(rows, backend, ep_size):
     topk = StandardTopKOutput(weights, ids, None)
 
     def forward():
-        return layer(x, topk, num_global_tokens=rows, max_num_tokens_per_gpu=rows)
+        return layer(
+            x,
+            topk,
+            num_global_tokens=rows,
+            max_num_tokens_per_gpu=rows,
+            do_finalize=True,
+        )
 
     # Independent route-by-route reference retains the pre-down cast boundary.
     expected = torch.zeros_like(x, dtype=torch.float32)
@@ -243,7 +259,9 @@ def test_mxfp4_moe_load_and_acl_replay(rows, backend, ep_size):
 @pytest.mark.parametrize("strided", [False, True])
 def test_engram_byte_table_and_acl_replay(width, strided):
     from tokenspeed.runtime.distributed import Mapping
-    from tokenspeed.runtime.models.deepseek_v41_engram import RowShardedEngramEmbedding
+    from tokenspeed.runtime.models.deepseek_v41_ascend910 import (
+        Ascend910EngramEmbedding as RowShardedEngramEmbedding,
+    )
 
     mapping = Mapping(world_size=1, rank=0, attn_tp_size=1)
     embed = RowShardedEngramEmbedding(
@@ -341,7 +359,9 @@ def test_engram_gate_matches_cpu_and_captures(zero_gate):
 @torch.inference_mode()
 def test_engram_lookup_exceeds_launch_grid_limit():
     from tokenspeed.runtime.distributed import Mapping
-    from tokenspeed.runtime.models.deepseek_v41_engram import RowShardedEngramEmbedding
+    from tokenspeed.runtime.models.deepseek_v41_ascend910 import (
+        Ascend910EngramEmbedding as RowShardedEngramEmbedding,
+    )
 
     model = RowShardedEngramEmbedding(
         4,
@@ -364,3 +384,60 @@ def test_engram_lookup_exceeds_launch_grid_limit():
     )
     actual = model(ids.to("npu"))
     torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)
+
+
+@torch.inference_mode()
+def test_registered_draft_checkpoint_prepares_910_components(monkeypatch):
+    from test.runtime.test_deepseek_v41_dspark import _draft_checkpoint, _draft_config
+    from test.runtime.test_deepseek_v41_model import _quant
+
+    from transformers import PretrainedConfig
+
+    from tokenspeed.runtime.distributed import Mapping
+    from tokenspeed.runtime.layers.linear import LinearBase
+    from tokenspeed.runtime.layers.moe import utils
+    from tokenspeed.runtime.models.registry import ModelRegistry
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    config = _draft_config()
+    config.hidden_size = config.moe_intermediate_size = 256
+    config.head_dim, config.qk_rope_head_dim = 512, 64
+    config.q_lora_rank = 128
+    config.num_attention_heads = config.o_groups = 2
+    mapping = Mapping(world_size=1, rank=0, attn_tp_size=1)
+    monkeypatch.setattr(utils, "MOE_BACKEND", utils.MoeBackend("ascend_v41_bf16"))
+    monkeypatch.setitem(global_server_args_dict, "mapping", mapping)
+    cls, _ = ModelRegistry.resolve_model_cls("DeepseekV41ForCausalLMDSpark")
+    previous = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.bfloat16)
+        with torch.device("npu"):
+            adapter = cls(PretrainedConfig(text_config=config), mapping, _quant())
+    finally:
+        torch.set_default_dtype(previous)
+    checkpoint = _draft_checkpoint(adapter.model)
+    adapter.load_weights(checkpoint.items())
+    for layer in adapter.modules():
+        if isinstance(layer, LinearBase):
+            layer.quant_method.process_weights_after_loading(layer)
+    adapter.post_quant_warmup()
+    model = adapter.model
+    assert adapter.checkpoint_load_report["loaded"] > 0
+    for stage, layer in enumerate(model.layers):
+        rows = slice(stage * config.head_dim, (stage + 1) * config.head_dim)
+        torch.testing.assert_close(
+            model.context_wkv.weight[rows],
+            layer.attn.wq_a_wkv.weight[config.q_lora_rank :],
+            atol=0,
+            rtol=0,
+        )
+    hidden = torch.randn(2, config.hidden_size, device="npu", dtype=torch.bfloat16)
+    head = torch.randn(
+        config.vocab_size, config.hidden_size, device="npu", dtype=torch.bfloat16
+    )
+    torch.testing.assert_close(
+        model.local_base_logits(hidden, head).cpu(),
+        hidden.cpu().float() @ head.cpu().float().T,
+        atol=1e-4,
+        rtol=1e-5,
+    )

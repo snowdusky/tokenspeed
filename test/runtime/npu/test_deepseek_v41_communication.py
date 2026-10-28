@@ -182,14 +182,30 @@ def test_hccl_fp32_sum_keeps_precision_across_transport_sizes(mapping, algorithm
 
 
 def test_v41_model_prepares_tp_policy_before_replay(mapping, monkeypatch):
-    from test.runtime.test_deepseek_v41_model import _loader_config, _loader_model
+    from test.runtime.test_deepseek_v41_model import _loader_config, _quant
+
+    from transformers import PretrainedConfig
 
     from tokenspeed.runtime.distributed.comm_backend import registry
+    from tokenspeed.runtime.layers.moe import utils
+    from tokenspeed.runtime.models.deepseek_v41_ascend910 import DeepseekV41ForCausalLM
 
     # Meta weights keep construction cheap; collectives below use real NPU data.
-    with monkeypatch.context() as weights:
-        model = _loader_model(weights, _loader_config(), mapping.rank, "meta")
-    model.mapping = mapping
+    monkeypatch.setattr(utils, "MOE_BACKEND", utils.MoeBackend("ascend_v41_bf16"))
+    monkeypatch.setitem(global_server_args_dict, "mapping", mapping)
+    previous_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.bfloat16)
+        with torch.device("meta"):
+            model = DeepseekV41ForCausalLM(
+                PretrainedConfig(text_config=_loader_config()),
+                mapping,
+                _quant(),
+                is_multimodal_active=False,
+                mm_attention_backend=None,
+            )
+    finally:
+        torch.set_default_dtype(previous_dtype)
     monkeypatch.setattr(registry, "_global_backend", HcclBackend())
     for name, value in (
         ("REDUCE_DTYPE", "float32"),

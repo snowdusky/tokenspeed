@@ -80,7 +80,9 @@ def test_v41_eplb_loaded_slots_migration_and_graph(group):
         ExpertCheckpointSchema,
         build_moe_checkpoint_loader,
     )
-    from tokenspeed.runtime.models.deepseek_v41 import DeepseekV41MoE
+    from tokenspeed.runtime.models.deepseek_v41_ascend910 import (
+        Ascend910MoE as DeepseekV41MoE,
+    )
     from tokenspeed.runtime.moe.eplb_algorithms import EplbAlgorithm
     from tokenspeed.runtime.moe.expert_load_rows import ExpertLoadRowMask
     from tokenspeed.runtime.moe.expert_location import (
@@ -88,7 +90,10 @@ def test_v41_eplb_loaded_slots_migration_and_graph(group):
         get_global_expert_location_metadata,
         set_global_expert_location_metadata,
     )
-    from tokenspeed.runtime.moe.expert_location_updater import ExpertLocationUpdater
+    from tokenspeed.runtime.moe.expert_location_updater import (
+        ExpertLocationUpdater,
+        _all_to_all_ep,
+    )
     from tokenspeed.runtime.moe.expert_rebalance import plan_slot_moves
     from tokenspeed.runtime.moe.placement_maps import compute_placement_maps
     from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -247,7 +252,7 @@ def test_v41_eplb_loaded_slots_migration_and_graph(group):
         process_group=group,
         peer_ranks=tuple(range(world)),
         ep_rank=rank,
-        all_to_all_ep=True,
+        all_to_all_ep=_all_to_all_ep(block),
         num_groups=None,
         num_nodes=world // int(os.environ["LOCAL_WORLD_SIZE"]),
     )

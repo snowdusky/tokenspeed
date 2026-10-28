@@ -25,7 +25,9 @@ import torch
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed import Mapping
-from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MLP
+from tokenspeed.runtime.models.deepseek_v41_ascend910 import (
+    Ascend910MLP as DeepseekV4MLP,
+)
 
 pytestmark = pytest.mark.skipif(not current_platform().is_npu, reason="requires Ascend")
 

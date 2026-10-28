@@ -25,10 +25,8 @@ duplicate and missing local text tensors, and reports explicit vision/draft skip
 Dense FP8 codes stay unchanged: 32x32 E8M0 scale rows expand losslessly to 1x32.
 On Hopper the dense projections load as BF16 weights instead -- codes widened on
 copy, scales folded in after loading, both exact -- and run the BF16 GEMM.
-Ascend loads FP8 code bytes through the same shard loaders and expands them
-to BF16 on device once, then uses the same unquantized Dense implementation.
-When TP cuts a scale block, repeating the original exponent into smaller blocks
-preserves its values and lets the ordinary shard loader select the local columns.
+Ascend-specific weight layouts and execution components are selected in
+``deepseek_v41_ascend910``; the checkpoint and forward contracts remain shared.
 Grouped wo_a is dequantized to BF16 after selecting this TP rank's rows.
 Engram tables load local FP8/E8M0 rows in bounded chunks without table conversion.
 The unquantized LM head follows the model loading dtype, including its logits.
@@ -77,7 +75,6 @@ import os
 import re
 from collections import Counter
 from collections.abc import Iterable
-from contextlib import nullcontext
 from copy import copy
 from dataclasses import dataclass
 from weakref import WeakValueDictionary
@@ -101,7 +98,6 @@ from tokenspeed_kernel.ops.gemm import (
 )
 from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.ops.quantization import (
-    dequantize_mxfp_weight,
     quantize_fp8,
     rmsnorm_quantize_fp8_group32,
     silu_and_mul_quantize_fp8_group32,
@@ -126,9 +122,6 @@ from tokenspeed.runtime.distributed.comm_ops import (
     supports_all_reduce_mhc_norm,
 )
 from tokenspeed.runtime.distributed.pp_stage import PPStageState
-from tokenspeed.runtime.distributed.process_group_manager import (
-    process_group_manager as pg_manager,
-)
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
     current_forward_ctx,
@@ -159,8 +152,6 @@ from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
 from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput
 from tokenspeed.runtime.layers.moe.utils import (
-    All2AllBackend,
-    get_all2all_backend,
     get_moe_backend,
 )
 from tokenspeed.runtime.layers.parameter import ModelWeightParameter
@@ -197,7 +188,6 @@ from tokenspeed.runtime.multimodal.inputs import (
 )
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
-from tokenspeed.runtime.utils.device_stream import StreamFork as DeviceStreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = logging.getLogger(__name__)
@@ -282,7 +272,7 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
         # every shape. So load the codes straight into a BF16 weight and fold
         # the power-of-two scales in once -- both exact in BF16 -- and run the
         # BF16 GEMM. Costs the FP8 weight size again.
-        self.load_as_bf16 = current_platform().is_hopper or current_platform().is_npu
+        self.load_as_bf16 = current_platform().is_hopper
 
     def create_weights(
         self,
@@ -294,57 +284,26 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        target_device = torch.empty(0).device
-        # Ascend stores checkpoint codes as bytes; the ordinary loader still
-        # selects TP shards. Postprocessing decodes only the local weight once.
-        byte_weight = current_platform().is_npu
-        if byte_weight:
-            # A TP shard can cut a checkpoint scale block (2304 / TP16 = 144).
-            # Repeat its exponent into smaller blocks without requantizing.
-            self.quant_config = copy(self.quant_config)
-            self.quant_config.weight_block_size = [
-                1,
-                math.gcd(32, input_size_per_partition),
-            ]
-        with (
-            torch.device("cpu")
-            if byte_weight and target_device.type != "meta"
-            else nullcontext()
-        ):
-            super().create_weights(
-                layer,
-                input_size_per_partition,
-                output_partition_sizes,
-                input_size,
-                output_size,
-                params_dtype,
-                **extra_weight_attrs,
-            )
+        super().create_weights(
+            layer,
+            input_size_per_partition,
+            output_partition_sizes,
+            input_size,
+            output_size,
+            params_dtype,
+            **extra_weight_attrs,
+        )
         if self.load_as_bf16:
             # Same shape and sharding loader as the FP8 parameter; the loader's
             # copy widens each E4M3 code to BF16 exactly.
             codes = layer.weight
             layer.weight = ModelWeightParameter(
-                data=torch.empty_like(
-                    codes.data,
-                    dtype=torch.uint8 if byte_weight else torch.bfloat16,
-                    device=target_device,
-                ),
+                data=torch.empty_like(codes.data, dtype=torch.bfloat16),
                 input_dim=codes.input_dim,
                 output_dim=codes.output_dim,
                 weight_loader=codes.weight_loader,
             )
             layer.weight.loads_fp8_codes = True
-        if byte_weight:
-            weight_loader = layer.weight.weight_loader
-
-            def load_codes(param, loaded_weight, *shard_ids):
-                if loaded_weight.dtype != torch.float8_e4m3fn:
-                    raise TypeError("V4.1 dense weights require FP8 E4M3 codes")
-                weight_loader(param, loaded_weight.view(torch.uint8), *shard_ids)
-
-            layer.weight._weight_loader = load_codes
-            layer.weight_scale_inv.data = layer.weight_scale_inv.data.to(target_device)
         scale = layer.weight_scale_inv
         original_loader = scale.weight_loader
 
@@ -364,9 +323,6 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
                         "V4.1 projection scales must use checkpoint 32x32 blocks"
                     )
             expanded = loaded_weight.view(torch.uint8).repeat_interleave(32, dim=0)
-            block_k = self.quant_config.weight_block_size[1]
-            if block_k != 32:
-                expanded = expanded.repeat_interleave(32 // block_k, dim=1)
             if isinstance(layer, ReplicatedLinear):
                 # Engram can have a partial final output block.
                 expanded = expanded[: param.shape[0]]
@@ -379,18 +335,10 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
             super().process_weights_after_loading(layer)
             self.prepare_weight_scales(layer)
             return
-        if current_platform().is_npu:
-            layer.weight.data = dequantize_mxfp_weight(
-                layer.weight,
-                layer.weight_scale_inv,
-                bits=8,
-                block_size=tuple(self.quant_config.weight_block_size),
-            )
-        else:
-            scale = layer.weight_scale_inv.data.view(torch.float8_e8m0fnu).to(
-                torch.bfloat16
-            )
-            layer.weight.data.unflatten(-1, (-1, 32)).mul_(scale.unsqueeze(-1))
+        scale = layer.weight_scale_inv.data.view(torch.float8_e8m0fnu).to(
+            torch.bfloat16
+        )
+        layer.weight.data.unflatten(-1, (-1, 32)).mul_(scale.unsqueeze(-1))
         layer.register_parameter("weight_scale_inv", None)
         layer.quant_method = UnquantizedLinearMethod()
         # Plans the batch-invariant GEMM under a bitwise envelope.
@@ -793,38 +741,16 @@ class DeepseekV41Compressor(nn.Module):
                 else F.linear(x.float(), self.wkv_wgate.weight.float())
             )
             content, scores = projected.chunk(2, dim=-1)
-            if x.device.type == "npu":
-                from tokenspeed_kernel.ops.attention import dsv41
-
-                # Keep history in the backend's LCM pool. Device-side masking
-                # avoids the CPU reference's dynamic NonZero during ACL capture.
-                plan = backend.query_metadata(mode).compressor
-                active, positions, requests, previous, slots, write_slots = plan
-                tail = backend.cache_pool.compressor_tail(owner)
-                pooled = dsv41.compressor_pool(
-                    content,
-                    scores,
-                    previous,
-                    tail,
-                    slots,
-                    active,
-                    None,
-                    self.norm.weight,
-                    self.norm.variance_epsilon,
-                )
-                dsv41.compressor_tail_scatter(content, scores, tail, write_slots)
-                content = pooled
-            else:
-                content, positions, requests = backend.compress(
-                    owner,
-                    content,
-                    scores,
-                    mode,
-                    self.norm.weight,
-                    self.norm.variance_epsilon,
-                )
+            content, positions, requests = self._compress(
+                owner, content, scores, backend, mode
+            )
             return content, positions, requests
         return _attention_norm(content, self.norm), positions, requests
+
+    def _compress(self, owner, content, scores, backend, mode):
+        return backend.compress(
+            owner, content, scores, mode, self.norm.weight, self.norm.variance_epsilon
+        )
 
 
 class DeepseekV41Indexer(nn.Module):
@@ -955,6 +881,9 @@ def _row_plan(layer_id: int, ced_decoder_start: int, ctx: ForwardContext) -> V41
 
 
 class DeepseekV41Attention(nn.Module):
+    stream_fork_cls = StreamFork
+    compressor_cls = DeepseekV41Compressor
+
     def __init__(
         self,
         config,
@@ -967,32 +896,13 @@ class DeepseekV41Attention(nn.Module):
         aux_stream: torch.cuda.Stream | None,
     ):
         super().__init__()
-        self.stream_fork = (
-            DeviceStreamFork(aux_stream)
-            if current_platform().is_npu
-            else StreamFork(aux_stream)
-        )
+        self.stream_fork = self.stream_fork_cls(aux_stream)
         self.layer_id = layer_id
         self.ced_decoder_start = ced_decoder_start
         self.mapping = mapping
         self.head_dim = config.head_dim
         self.n_local_heads = config.num_attention_heads // mapping.attn.tp_size
-        self.n_local_groups = max(1, config.o_groups // mapping.attn.tp_size)
-        output_tp = max(1, mapping.attn.tp_size // config.o_groups)
-        self.o_lora_rank = config.o_lora_rank // output_tp
-        self.output_group: tuple[int, ...] = ()
-        self.output_group_rank = mapping.attn.tp_rank % output_tp
-        if output_tp > 1:
-            if (
-                not current_platform().is_npu
-                or mapping.attn.tp_size % config.o_groups
-                or config.o_lora_rank % output_tp
-            ):
-                raise ValueError("Output-group sharding requires divisible Ascend TP")
-            start = mapping.attn.tp_rank - self.output_group_rank
-            self.output_group = mapping.attn.tp_group[start : start + output_tp]
-            if torch.empty(0).device.type != "meta":
-                pg_manager.init_process_group(self.output_group)
+        self._configure_output_geometry(config, mapping)
         self.compress_ratio = config.compress_ratios[layer_id]
         self.is_kv_source = layer_id in config.kv_source_layer_ids
         self.is_index_source = layer_id in config.index_source_layer_ids
@@ -1050,7 +960,7 @@ class DeepseekV41Attention(nn.Module):
             interleave_linear_and_gate=False,
         )
         self.compressor = (
-            DeepseekV41Compressor(config, layer_id, add_prefix("compressor", prefix))
+            self.compressor_cls(config, layer_id, add_prefix("compressor", prefix))
             if self.is_kv_source
             else None
         )
@@ -1200,10 +1110,7 @@ class DeepseekV41Attention(nn.Module):
         overlap = (
             mode.is_decode()
             and self.is_index_source
-            and (
-                hidden_states.is_cuda
-                or (hidden_states.device.type == "npu" and rows.keep_rows is None)
-            )
+            and self._can_overlap_index(hidden_states, rows)
             and hidden_states.numel() > 0
             and self.stream_fork.aux_stream is not None
             and self.stream_fork.aux_stream.device == hidden_states.device
@@ -1336,15 +1243,7 @@ class DeepseekV41Attention(nn.Module):
                 for tensor in (record.candidates.block_ids, record.candidates.lengths):
                     tensor.record_stream(consumer)
         # CDNA4/5 rotate the attention output back inside the attention kernel.
-        out_rope_cache = (
-            self.rotary_emb.inverse_cos_sin_cache
-            if current_platform().is_npu
-            or (
-                q.is_cuda
-                and (current_platform().is_cdna4 or current_platform().is_cdna5)
-            )
-            else None
-        )
+        out_rope_cache = self._output_rope_cache(q)
         out = backend.forward_v41(
             q,
             swa,
@@ -1396,42 +1295,30 @@ class DeepseekV41Attention(nn.Module):
             )
         return out
 
-    def _group_attention_output(self, out: torch.Tensor) -> torch.Tensor:
-        if self.output_group:
-            # TP wider than o_groups splits one group's heads across ranks.
-            # Assemble disjoint heads before GEMM so each output-row shard
-            # retains the original full dot product and BF16 cast boundary.
-            left = self.output_group_rank * self.n_local_heads
-            right = (
-                len(self.output_group) - self.output_group_rank - 1
-            ) * self.n_local_heads
-            out = all_reduce(
-                F.pad(out, (0, 0, left, right)),
-                group=self.output_group,
-                backend=None,
-                op=torch.distributed.ReduceOp.SUM,
-            )
+    def _group_attention_output(self, out):
         return out.reshape(out.shape[0], self.n_local_groups, -1)
 
+    def _configure_output_geometry(self, config, mapping):
+        self.n_local_groups = config.o_groups // mapping.attn.tp_size
+        self.o_lora_rank = config.o_lora_rank
 
-def _npu_dp_moe(mapping) -> bool:
-    from tokenspeed.runtime.models.deepseek_v41_parallel import supports_ascend_dp_moe
+    def _can_overlap_index(self, hidden_states, rows):
+        return hidden_states.is_cuda
 
-    if get_all2all_backend() is All2AllBackend.ASCEND_MC2:
-        return False
-    enabled = supports_ascend_dp_moe(
-        mapping, get_moe_backend().value, current_platform().is_npu
-    )
-    if enabled and global_server_args_dict["moe_combine_order"] != "rank":
-        raise ValueError("Ascend V4.1 DP MoE requires --moe-combine-order rank")
-    return enabled
+    def _output_rope_cache(self, q):
+        return (
+            self.rotary_emb.inverse_cos_sin_cache
+            if q.is_cuda
+            and (current_platform().is_cdna4 or current_platform().is_cdna5)
+            else None
+        )
 
 
 class DeepseekV41MoE(DeepseekV4MoE):
     """V4 expert execution with V4.1 routing and lossless MegaMoE alignment."""
 
     def __init__(self, config, mapping, quant_config, layer_index, prefix, aux_stream):
-        self.dp_replicated_rows = _npu_dp_moe(mapping)
+        self.dp_replicated_rows = self._replicate_dp_rows(mapping)
         expert_config = config
         padded = (
             get_moe_backend().is_mega_moe() and config.moe_intermediate_size % 512 != 0
@@ -1447,11 +1334,6 @@ class DeepseekV41MoE(DeepseekV4MoE):
         super().__init__(
             expert_config, mapping, quant_config, layer_index, prefix, aux_stream
         )
-        if get_all2all_backend() is All2AllBackend.ASCEND_MC2:
-            # Bind MC2's private window before expert weight postprocessing.
-            self.experts.plan["process_group"] = pg_manager.get_dedicated_device_group(
-                mapping.moe.ep_group, "ascend_mc2"
-            )
         self.gate.register_parameter("bias_vl", None)
         if padded:
             self.config = config
@@ -1469,11 +1351,8 @@ class DeepseekV41MoE(DeepseekV4MoE):
                     is_shared_expert=False,
                 )
 
-    def _owns_ep_communication(self) -> bool:
-        return (
-            super()._owns_ep_communication()
-            or get_all2all_backend() is All2AllBackend.ASCEND_MC2
-        )
+    def _replicate_dp_rows(self, mapping):
+        return False
 
     def _uses_replicated_dp_rows(self) -> bool:
         return self.dp_replicated_rows
@@ -1610,6 +1489,15 @@ class DeepseekV41DecoderLayer(nn.Module):
     communication fusion crosses its coefficient join, without a late fallback.
     """
 
+    attention_cls = DeepseekV41Attention
+    moe_cls = DeepseekV41MoE
+    engram_cls = DeepseekV41Engram
+    stream_fork_cls = StreamFork
+    dense_quant_config = staticmethod(v41_mxfp8_config)
+
+    def _expert_aux_stream(self, aux_stream):
+        return aux_stream
+
     def __init__(
         self,
         config,
@@ -1628,13 +1516,9 @@ class DeepseekV41DecoderLayer(nn.Module):
         self.ced_decoder_start = ced_decoder_start
         self.norm_eps, self.hc_eps = config.rms_norm_eps, config.hc_eps
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
-        self.hc_stream_fork = (
-            DeviceStreamFork(hc_stream)
-            if hc_stream is not None and hc_stream.device.type == "npu"
-            else StreamFork(hc_stream)
-        )
-        dense_quant = v41_mxfp8_config(quant_config)
-        self.attn = DeepseekV41Attention(
+        self.hc_stream_fork = self.stream_fork_cls(hc_stream)
+        dense_quant = self.dense_quant_config(quant_config)
+        self.attn = self.attention_cls(
             config,
             mapping,
             layer_id,
@@ -1643,14 +1527,13 @@ class DeepseekV41DecoderLayer(nn.Module):
             add_prefix("attn", prefix),
             aux_stream=aux_stream,
         )
-        self.ffn = DeepseekV41MoE(
+        self.ffn = self.moe_cls(
             config,
             mapping,
             dense_quant,
             layer_id,
             add_prefix("ffn", prefix),
-            # NPU MC2 already owns its shared-expert stream.
-            aux_stream=None if current_platform().is_npu else aux_stream,
+            aux_stream=self._expert_aux_stream(aux_stream),
         )
         self.comm_manager = CommManager(
             mapping=mapping,
@@ -1665,7 +1548,7 @@ class DeepseekV41DecoderLayer(nn.Module):
         self.attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.engram = (
-            DeepseekV41Engram(
+            self.engram_cls(
                 config,
                 layer_id,
                 mapping,
@@ -1905,12 +1788,6 @@ class DeepseekV41DecoderLayer(nn.Module):
         """
         # Fused EP returns this rank's rows, including an empty tensor on idle
         # ranks. HC residuals therefore stay local across dispatch/combine.
-        if self.ffn.dp_replicated_rows:
-            from tokenspeed.runtime.models.deepseek_v41_parallel import (
-                replicated_rows_moe,
-            )
-
-            return replicated_rows_moe(x, image_mask, ctx, self.ffn, self.comm_manager)
         if self.ffn.owns_ep_communication:
             if defer_reduce:
                 raise ValueError(
@@ -2044,6 +1921,8 @@ class V41RowState:
 
 class DeepseekV41Model(nn.Module):
     fall_back_to_pt_during_load = False
+    layer_cls = DeepseekV41DecoderLayer
+    dense_quant_config = staticmethod(v41_mxfp8_config)
 
     def __init__(
         self,
@@ -2057,45 +1936,13 @@ class DeepseekV41Model(nn.Module):
         super().__init__()
         if mapping.pp_size != 1:
             raise NotImplementedError("V4.1 full-prompt baseline requires PP=1")
-        local_fused_ep = (
-            (
-                get_moe_backend().is_gluon_petit()
-                or get_moe_backend().is_mega_moe()
-                or get_all2all_backend() is All2AllBackend.ASCEND_MC2
-            )
-            and mapping.attn.tp_size
-            == mapping.dense.tp_size
-            == mapping.moe.tp_size
-            == 1
-        )
-        if get_all2all_backend() is All2AllBackend.ASCEND_MC2 and not local_fused_ep:
-            raise ValueError("Ascend MC2 requires attention, dense and MoE TP1")
-        self.dp_replicated_rows = _npu_dp_moe(mapping)
-        self.decoder_cpu_group = None
-        if self.dp_replicated_rows:
-            from tokenspeed.runtime.models.deepseek_v41_parallel import (
-                create_decoder_cpu_group,
-            )
-
-            self.decoder_cpu_group = create_decoder_cpu_group(mapping)
-        if mapping.attn.tp_size != mapping.moe.tp_ep_size and not (
-            local_fused_ep or self.dp_replicated_rows
-        ):
-            raise NotImplementedError(
-                "V4.1 requires attention TP == MoE TPxEP or fused EP with attention/dense/MoE TP1"
-            )
+        self._configure_parallelism(mapping)
         if config.hc_mult != 4 or config.hc_sinkhorn_iters < 1:
             raise ValueError(
                 "V4.1 requires four HC copies and at least one Sinkhorn iteration"
             )
         if config.num_hash_layers != 0:
             raise ValueError("V4.1 uses learned MoE routing, not V4 hash routing")
-        output_groups_divide = config.o_groups % mapping.attn.tp_size == 0
-        output_group_shards_divide = (
-            current_platform().is_npu
-            and mapping.attn.tp_size % config.o_groups == 0
-            and config.o_lora_rank % (mapping.attn.tp_size // config.o_groups) == 0
-        )
         if (
             any(
                 n % mapping.attn.tp_size
@@ -2104,7 +1951,7 @@ class DeepseekV41Model(nn.Module):
                     config.index_n_heads,
                 )
             )
-            or not (output_groups_divide or output_group_shards_divide)
+            or not self._output_groups_divide(config, mapping)
             or config.num_attention_heads % config.o_groups
         ):
             raise ValueError(
@@ -2147,7 +1994,7 @@ class DeepseekV41Model(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                DeepseekV41DecoderLayer(
+                self.layer_cls(
                     config,
                     mapping,
                     layer_id,
@@ -2172,6 +2019,27 @@ class DeepseekV41Model(nn.Module):
         self.decoder_uses_engram = any(
             layer_id > self.ced_decoder_start for layer_id in config.engram_layer_ids
         )
+
+    def _configure_parallelism(self, mapping):
+        self.dp_replicated_rows = False
+        self.decoder_cpu_group = None
+        local_fused_ep = (
+            (get_moe_backend().is_gluon_petit() or get_moe_backend().is_mega_moe())
+            and mapping.attn.tp_size
+            == mapping.dense.tp_size
+            == mapping.moe.tp_size
+            == 1
+        )
+        if mapping.attn.tp_size != mapping.moe.tp_ep_size and not local_fused_ep:
+            raise NotImplementedError(
+                "V4.1 requires attention TP == MoE TPxEP or fused EP with attention/dense/MoE TP1"
+            )
+
+    def _output_groups_divide(self, config, mapping):
+        return config.o_groups % mapping.attn.tp_size == 0
+
+    def _decoder_counts(self, ctx):
+        return None
 
     def initialize_engram(self, tokenizer) -> None:
         """Initialize immutable tokenizer/hash constants once; never request history."""
@@ -2202,18 +2070,7 @@ class DeepseekV41Model(nn.Module):
         invocations are unsupported. The four stages below are the whole
         forward; the prefill graph calls them individually.
         """
-        decoder_counts = None
-        # Window-only draft stacks never narrow rows. In a mixed target round,
-        # their idle ranks must join draft MoE collectives without exchanging
-        # target decoder counts that active draft ranks do not compute.
-        if self.dp_replicated_rows and self.ced_decoder_start < len(self.layers):
-            from tokenspeed.runtime.models.deepseek_v41_parallel import (
-                decoder_global_rows,
-            )
-
-            decoder_counts = decoder_global_rows(
-                ctx, self.mapping, self.decoder_cpu_group
-            )
+        decoder_counts = self._decoder_counts(ctx)
         if input_ids.numel() == 0:
             if self.mapping.attn.has_dp:
                 hidden = self.embed_tokens.weight.new_empty(
@@ -2624,7 +2481,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
     """V4.1 language and vision model with strict checkpoint coverage."""
 
     model_cls = DeepseekV41Model
-    supports_expert_placement = current_platform().is_npu
+    supports_expert_placement = False
 
     def __init__(
         self,
@@ -2664,18 +2521,6 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                     )
             self.vision_embedder = VisionEmbedder(encoder_mapping=mapping.vision)
             self.image_encoder = self.vision.embed_media
-
-    def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
-        """Prepare the selected Ascend TP policy before cache profiling or capture."""
-        if not current_platform().is_npu:
-            return False
-        from tokenspeed.runtime.distributed.comm_backend.hccl_tp import (
-            prepare_hccl_tp_groups,
-        )
-
-        return prepare_hccl_tp_groups(
-            self.mapping.attn.tp_group, nprocs_per_node=self.mapping.nprocs_per_node
-        )
 
     @property
     def routed_experts_weights_of_layer(self):
@@ -2941,30 +2786,15 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             # Keep the dtype marker to reject a scale arriving after BF16 weights.
             pair["weight"] = weight.new_empty(0)
         elif scale is not None:
-            if linear.weight.device.type == "npu":
-                expanded = scale.repeat_interleave(32, dim=0)[
-                    start % 32 : start % 32 + rows
-                ]
-                decoded = dequantize_mxfp_weight(
-                    weight.view(torch.uint8).to(linear.weight.device),
-                    expanded.to(linear.weight.device),
-                    bits=8,
-                    block_size=(1, 32),
-                )
-                default_weight_loader(linear.weight, decoded)
-            else:
-                scale = (
-                    scale.to(linear.weight.device).view(torch.float8_e8m0fnu).float()
-                )
-                scale = scale.repeat_interleave(32, dim=0)[
-                    start % 32 : start % 32 + rows
-                ]
-                weight = weight.to(linear.weight.device).float().unflatten(-1, (-1, 32))
-                default_weight_loader(
-                    linear.weight,
-                    (weight * scale.unsqueeze(-1)).flatten(-2).to(torch.bfloat16),
-                )
+            decoded = self._decode_output_weight(linear, weight, scale, start, rows)
+            default_weight_loader(linear.weight, decoded)
             del pending[key]
+
+    def _decode_output_weight(self, linear, weight, scale, start, rows):
+        scale = scale.to(linear.weight.device).view(torch.float8_e8m0fnu).float()
+        scale = scale.repeat_interleave(32, dim=0)[start % 32 : start % 32 + rows]
+        weight = weight.to(linear.weight.device).float().unflatten(-1, (-1, 32))
+        return (weight * scale.unsqueeze(-1)).flatten(-2).to(torch.bfloat16)
 
     @torch.no_grad()
     def _load_text_weights(
@@ -3225,17 +3055,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
 
     def post_load_weights(self) -> None:
         for module in self.modules():
-            if (
-                isinstance(module, DeepseekV41Attention)
-                and module.wo_a.weight.device.type == "npu"
-                and module.n_local_groups == 1
-            ):
-                weight = module.wo_a.weight
-                if weight.is_contiguous():
-                    # BMM consumes [K, N]. Prepare that storage once while
-                    # retaining the logical [N, K] parameter and its BF16 values.
-                    weight.data = weight.T.contiguous().T
-            elif isinstance(module, MoELayer):
+            if isinstance(module, MoELayer):
                 module.process_weights_after_loading(module)
             elif isinstance(module, LinearBase) and isinstance(
                 module.quant_method, _ReferenceFp8LinearMethod
@@ -3252,16 +3072,6 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         for module in self.modules():
             if isinstance(module, DeepseekV4MoE):
                 module.warmup()
-        if current_platform().is_npu:
-            # This prepares codec constants, not an executable kernel choice.
-            # Codec constants must exist before query partitioning leaves some
-            # ranks idle: a blocking first-use H2D copy can wait behind collectives.
-            from tokenspeed_kernel.ops.attention.dsv41.ascend import (
-                prepare_native_tables,
-            )
-
-            device = torch.device("npu", torch.npu.current_device())
-            prepare_native_tables(device)
 
     def get_input_embeddings(self) -> nn.Module:
         return self.model.embed_tokens
@@ -3326,6 +3136,3 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         missing = params.keys() - loaded
         if missing:
             raise ValueError(f"Missing V4.1 vision tensors: {sorted(missing)}")
-
-
-EntryClass = DeepseekV41ForCausalLM

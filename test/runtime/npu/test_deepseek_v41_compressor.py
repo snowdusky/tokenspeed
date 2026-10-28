@@ -28,7 +28,9 @@ from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.deepseek_v41_config import DeepseekV41TextConfig
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.models.deepseek_v41 import DeepseekV41Compressor
+from tokenspeed.runtime.models.deepseek_v41_ascend910 import (
+    Ascend910Compressor as DeepseekV41Compressor,
+)
 
 pytestmark = pytest.mark.skipif(not current_platform().is_npu, reason="requires Ascend")
 

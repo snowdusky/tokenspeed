@@ -456,6 +456,8 @@ def _dequant_fp8_e8m0(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor
 class RowShardedEngramEmbedding(nn.Module):
     """FP8 codes and raw E8M0 scale bytes, GPU-sharded or host-resident."""
 
+    device_weight_dtype = torch.float8_e4m3fn
+
     def __init__(
         self,
         num_embeddings: int,
@@ -554,11 +556,7 @@ class RowShardedEngramEmbedding(nn.Module):
                 torch.empty(
                     self.part_num_embeddings,
                     embedding_dim,
-                    dtype=(
-                        torch.uint8
-                        if torch.device(device).type == "npu"
-                        else torch.float8_e4m3fn
-                    ),
+                    dtype=self.device_weight_dtype,
                     device=device,
                 ),
                 requires_grad=False,
@@ -587,14 +585,6 @@ class RowShardedEngramEmbedding(nn.Module):
     def _register_host_for_gpu(self) -> None:
         """cudaHostRegister once. Gather kernels must not register."""
         if self._host_gpu_registered or not self.host_table:
-            return
-        if self.compute_device.type == "npu":
-            from tokenspeed_kernel.ops.embedding import prepare_host_mxfp8_embedding
-
-            self._host_lookup = prepare_host_mxfp8_embedding(
-                self.weight, self.scale, self.row_start, self.row_end
-            )
-            self._host_gpu_registered = True
             return
         if self.compute_device.type != "cuda" or not torch.cuda.is_available():
             self._host_gpu_registered = True
@@ -685,13 +675,26 @@ class RowShardedEngramEmbedding(nn.Module):
         only local rows and reduce. Dequantization uses the same FP8/E8M0
         torch casts in both paths.
         """
-        if indices.device.type == "npu" and self.host_table:
-            if self._host_lookup is None:
-                raise RuntimeError(
-                    "Host Engram mapping must be prepared before forward"
-                )
-            values = self._host_lookup(indices.to(torch.int64).contiguous())
-        elif indices.device.type in ("cuda", "npu") and not self.host_table:
+        values = self._lookup(indices)
+        if len(self.tp_group) > 1 and self.host_layout != "shared":
+            # The workspace all-reduce sizes itself on rows x trailing width.
+            # Reduce one row per token, [rows, columns * head_dim]: the lane is
+            # widened for that at construction (DeepseekV41Engram), so a
+            # decode batch stays inside the one-shot window. As
+            # [rows * columns, head_dim] the same bytes exceed the window's
+            # row capacity and drop to NCCL, which costs a ring latency plus a
+            # launch stall on every step.
+            flat = values.reshape(-1, values.shape[-2] * values.shape[-1])
+            values = all_reduce(
+                flat,
+                group=self.tp_group,
+                backend=None,
+                op=torch.distributed.ReduceOp.SUM,
+            ).view(values.shape)
+        return values
+
+    def _lookup(self, indices):
+        if indices.device.type in ("cuda", "npu") and not self.host_table:
             from tokenspeed_kernel.ops.embedding import mxfp8_embedding
 
             # Each layer's 2D hash slice can be gathered directly; retain the
@@ -721,21 +724,6 @@ class RowShardedEngramEmbedding(nn.Module):
                     self.weight.view(torch.uint8)[local_ids], self.scale[local_ids]
                 )
             values = values.masked_fill(~local.unsqueeze(-1), 0)
-        if len(self.tp_group) > 1 and self.host_layout != "shared":
-            # The workspace all-reduce sizes itself on rows x trailing width.
-            # Reduce one row per token, [rows, columns * head_dim]: the lane is
-            # widened for that at construction (DeepseekV41Engram), so a
-            # decode batch stays inside the one-shot window. As
-            # [rows * columns, head_dim] the same bytes exceed the window's
-            # row capacity and drop to NCCL, which costs a ring latency plus a
-            # launch stall on every step.
-            flat = values.reshape(-1, values.shape[-2] * values.shape[-1])
-            values = all_reduce(
-                flat,
-                group=self.tp_group,
-                backend=None,
-                op=torch.distributed.ReduceOp.SUM,
-            ).view(values.shape)
         return values
 
 
@@ -752,6 +740,8 @@ def engram_reduce_lane_width(layout: EngramLayout) -> int:
 
 class DeepseekV41Engram(nn.Module):
     """Reference normalized-dot, signed-sqrt gate over four hyperconnection copies."""
+
+    embedding_cls = RowShardedEngramEmbedding
 
     def __init__(
         self,
@@ -772,15 +762,8 @@ class DeepseekV41Engram(nn.Module):
         """
         super().__init__()
         layout = EngramLayout.from_config(config)
-        from tokenspeed.runtime.models.deepseek_v41_parallel import (
-            resolve_engram_table_mapping,
-        )
-
-        table_mapping, self.row_exchange = resolve_engram_table_mapping(
-            mapping,
-            global_server_args_dict["engram_tp_size"],
-            device_type=torch.device(device).type,
-            host_table=host_table,
+        table_mapping, self.row_exchange = self._table_mapping(
+            mapping, device, host_table
         )
         # These tables are consulted before CED narrowing, where the scheduler's
         # global input row counts apply to both eager and captured execution.
@@ -831,7 +814,7 @@ class DeepseekV41Engram(nn.Module):
             raise ValueError(
                 "Do not exclude Engram wkv from checkpoint FP8 quantization"
             )
-        self.embed = RowShardedEngramEmbedding(
+        self.embed = self.embedding_cls(
             layout.num_embeddings[self.layer_hash_index],
             layout.head_dim,
             table_mapping,
@@ -932,14 +915,18 @@ class DeepseekV41Engram(nn.Module):
         )
         dot = (h * weight * key).sum(-1) * rstd * self.dim**-0.5
         magnitude = dot.abs().clamp_min(1e-6).sqrt()
-        if hidden_states.device.type == "npu":
-            # copysign falls back to CPU on Ascend, which breaks ACL capture.
-            # Read the FP32 sign bit so negative zero keeps its sign as well.
-            signed = torch.where(dot.view(torch.int32) < 0, -magnitude, magnitude)
-        else:
-            signed = torch.copysign(magnitude, dot)
+        signed = self._signed_magnitude(dot, magnitude)
         gate = torch.sigmoid(signed)
         gate = gate.masked_fill(~token_mask.unsqueeze(-1), 0)
         return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(
             hidden_states.dtype
         )
+
+    def _table_mapping(self, mapping, device, host_table):
+        requested = global_server_args_dict["engram_tp_size"]
+        if requested not in (None, mapping.attn.tp_size):
+            raise ValueError("Wider Engram tables require the Ascend implementation")
+        return mapping, None
+
+    def _signed_magnitude(self, dot, magnitude):
+        return torch.copysign(magnitude, dot)
