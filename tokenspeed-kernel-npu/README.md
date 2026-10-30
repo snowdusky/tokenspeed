@@ -24,6 +24,9 @@ Transformers 5.12.0, Triton 3.2.0, and Triton-Ascend 3.2.1. The setup script
 records every Python package mutation needed by this Ascend path, including the
 `apache-tvm-ffi==0.1.13` build dependency and editable install of this package.
 
+MXFP8 embedding lookup accepts strided two-dimensional indices directly,
+including per-layer Engram hash slices, without copying them to a contiguous buffer.
+
 TokenSpeed applications should continue to import operators from
 `tokenspeed-kernel`; it owns registration and dispatch to this package.
 

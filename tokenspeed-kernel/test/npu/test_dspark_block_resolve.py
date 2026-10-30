@@ -23,7 +23,68 @@
 import pytest
 import torch
 import torch_npu
+from tokenspeed_kernel.ops.sampling.dspark_block import (
+    dspark_block_candidate_tiles,
+    dspark_block_greedy_step,
+)
 from tokenspeed_kernel_npu.ops.dspark_block import dspark_block_greedy_resolve
+
+
+@pytest.mark.parametrize("rows", [1, 4])
+def test_public_greedy_entry_and_replay(rows):
+    """Greedy DSpark works independently of the optional full-sampling backend."""
+    from tokenspeed_kernel.numerics.torch.sampling import torch_dspark_block_greedy
+
+    generator = torch.Generator().manual_seed(91)
+    block, vocab, rank = 3, 1024, 32
+    cpu_base = torch.randn(rows, block, vocab, generator=generator) * 8
+    cpu_embedding = torch.randn(vocab, rank, generator=generator).bfloat16()
+    cpu_projection = torch.randn(vocab, rank, generator=generator).bfloat16()
+    cpu_anchors = torch.arange(rows, dtype=torch.int32)
+    base = cpu_base.to("npu")
+    embedding = cpu_embedding.to("npu")
+    projection = cpu_projection.to("npu")
+    anchors = cpu_anchors.to("npu")
+    tiles = dspark_block_candidate_tiles(vocab)
+    candidates = torch.empty((1, rows, tiles), dtype=torch.int64, device="npu")
+    partials = torch.empty((rows, tiles), dtype=torch.int64, device="npu")
+    output = torch.empty((rows, block), dtype=torch.int32, device="npu")
+
+    def forward():
+        for step in range(block):
+            dspark_block_greedy_step(
+                base,
+                step,
+                anchors,
+                candidates,
+                embedding,
+                projection,
+                0,
+                vocab,
+                partials,
+                output,
+            )
+            candidates[0].copy_(partials)
+        dspark_block_greedy_resolve(candidates, output, block - 1)
+
+    for _ in range(2):
+        forward()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph, auto_dispatch_capture=True):
+        forward()
+    try:
+        for shift in (0, 17):
+            current = cpu_base.roll(shift, dims=-1)
+            base.copy_(current)
+            graph.replay()
+            torch.npu.synchronize()
+            expected = torch_dspark_block_greedy(
+                current, cpu_anchors, cpu_embedding, cpu_projection
+            )
+            torch.testing.assert_close(output.cpu().long(), expected, atol=0, rtol=0)
+    finally:
+        torch.npu.synchronize()
+        graph.reset()
 
 
 @pytest.mark.parametrize("tp,tiles", [(1, 505), (2, 253), (4, 127), (8, 64)])

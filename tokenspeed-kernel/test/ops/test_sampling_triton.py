@@ -27,12 +27,12 @@ from tokenspeed_kernel.numerics.torch.sampling import (
     torch_dspark_block_greedy,
     torch_top_k_top_p_support,
 )
+from tokenspeed_kernel.ops.sampling.dspark_block import dspark_block_greedy_step
 from tokenspeed_kernel.ops.sampling.triton import (
     _QRITA_PERCENTILE_TO_STD_TABLE,
     dflash2_greedy_path,
     dspark_block_candidate_tiles,
     dspark_block_greedy_resolve,
-    dspark_block_greedy_step,
     gumbel_sample_from_pools,
     gumbel_sample_from_pools_compact,
     gumbel_sample_from_pools_generic,

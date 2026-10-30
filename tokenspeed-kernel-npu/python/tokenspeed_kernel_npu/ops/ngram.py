@@ -327,3 +327,114 @@ def prepare_ngram_inputs(
         # Reject uncovered snapshots instead of silently hashing stale history.
         debug=True,
     )
+
+
+# Fixed tile: a batch-sized tile would compile once per power-of-two batch.
+_COMMIT_ROWS = 128
+
+
+@triton.jit(do_not_specialize=["bs", "num_extends", "capacity"])
+def _commit_ngram(
+    slots,
+    lengths,
+    accepted,
+    ids,
+    previous,
+    token_mask,
+    prefix,
+    tail,
+    needs_seed,
+    cache_lengths,
+    bs,
+    num_extends,
+    padding_slot: tl.constexpr,
+    capacity,
+    ROWS: tl.constexpr,
+):
+    first = tl.program_id(0) * ROWS
+    rows = first + tl.arange(0, ROWS)
+    cols = tl.arange(0, 4)
+    valid = rows < bs
+    slot = tl.load(slots + rows, valid, other=padding_slot)
+    live = valid & (slot != padding_slot)
+    sizes = tl.load(lengths + rows, valid, other=0)
+    count = tl.load(accepted + rows, valid, other=0)
+    delta = tl.where(rows < num_extends, sizes, count)
+    delta = tl.where(live, delta, 0)
+    start = tl.full((), 0, sizes.dtype)
+    for chunk in range(0, first, ROWS):
+        start += tl.sum(tl.load(lengths + chunk + tl.arange(0, ROWS)))
+    # Ascend must not form any load from a zero-sized input allocation,
+    # even when every lane is masked. Zero-input commits only restore prefix.
+    if capacity > 0:
+        last = tl.minimum(
+            tl.maximum(start + tl.cumsum(sizes) - sizes + delta - 1, 0), capacity - 1
+        )
+        advancing = live & (delta > 0)
+        raw = tl.load(ids + last, advancing, other=-1).to(tl.int64)
+        mask = tl.load(token_mask + last, advancing, other=False).to(tl.int1)
+        current = tl.where(mask, raw, -1)
+        past = tl.load(
+            previous + last[:, None] * 3 + cols[None, :] - 1,
+            advancing[:, None] & (cols[None, :] > 0) & (cols[None, :] < 3),
+            other=-1,
+        )
+    else:
+        current = tl.full((ROWS,), -1, tl.int64)
+        past = tl.full((ROWS, 4), -1, tl.int64)
+    initial = tl.load(
+        prefix + rows[:, None] * 3 + cols[None, :],
+        live[:, None] & (delta[:, None] == 0) & (cols[None, :] < 3),
+        other=-1,
+    )
+    value = tl.where(
+        delta[:, None] > 0,
+        tl.where(cols[None, :] == 0, current[:, None], past),
+        initial,
+    )
+    tl.store(
+        tail + slot[:, None] * 3 + cols[None, :],
+        value,
+        live[:, None] & (cols[None, :] < 3),
+    )
+    tl.store(needs_seed + slot, False, live)
+    frontier = tl.load(cache_lengths + slot, live, other=0)
+    tl.store(cache_lengths + slot, frontier + delta, live)
+
+
+def commit_ngram_inputs(
+    slots,
+    lengths,
+    accepted,
+    ids,
+    previous,
+    token_mask,
+    prefix,
+    tail,
+    needs_seed,
+    cache_lengths,
+    num_extends,
+    padding_slot,
+) -> None:
+    """Commit the accepted Engram frontier, including zero-input replays."""
+    bs = slots.numel()
+    if bs:
+        rows = _COMMIT_ROWS
+        _commit_ngram[(triton.cdiv(bs, rows),)](
+            slots,
+            lengths,
+            accepted,
+            ids,
+            previous,
+            token_mask,
+            prefix,
+            tail,
+            needs_seed,
+            cache_lengths,
+            bs,
+            num_extends,
+            padding_slot,
+            previous.shape[0],
+            rows,
+            num_warps=4,
+        )

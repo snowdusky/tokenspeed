@@ -32,7 +32,7 @@ from contextlib import nullcontext
 from copy import copy
 
 import torch
-from tokenspeed_kernel.ops.activation import silu_and_mul
+from tokenspeed_kernel.ops.activation.dsv41 import shared_expert_swiglu
 from tokenspeed_kernel.ops.attention import dsv41
 from tokenspeed_kernel.ops.moe import moe_apply, moe_plan, moe_process_weights
 from tokenspeed_kernel.ops.quantization import dequantize_mxfp_weight
@@ -197,7 +197,9 @@ class Ascend910MLP(DeepseekV4MLP):
         gate_up, _ = self.gate_up_proj(x)
         if gate_up.dtype != torch.bfloat16:
             return self.down_proj.forward_with_activation(gate_up, self.act_fn)[0]
-        return self.down_proj(silu_and_mul(gate_up, limit=self.act_fn.swiglu_limit))[0]
+        return self.down_proj(
+            shared_expert_swiglu(gate_up, limit=self.act_fn.swiglu_limit)
+        )[0]
 
 
 class Ascend910Compressor(shared.DeepseekV41Compressor):

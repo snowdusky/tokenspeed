@@ -13,7 +13,7 @@ bias of a shard column lands on the rank that owns that column's base logit.
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.sampling.triton import (
+from tokenspeed_kernel.ops.sampling.dspark_block import (
     dspark_block_candidate_tiles,
     dspark_block_greedy_resolve,
     dspark_block_greedy_step,

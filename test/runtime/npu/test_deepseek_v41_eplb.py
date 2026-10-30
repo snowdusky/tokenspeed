@@ -114,7 +114,7 @@ def test_v41_eplb_loaded_slots_migration_and_graph(group):
     )
     placement.enable_load_recording(mapping)
     placement.load_rows = ExpertLoadRowMask.for_all_to_all(mapping)
-    placement.reserve_load_rows(16)
+    placement.reserve_load_rows(48)
     quant = {
         "format": "int-quantized",
         "w4a4_gmm_is_transposed": True,
@@ -259,7 +259,7 @@ def test_v41_eplb_loaded_slots_migration_and_graph(group):
     updater.prewarm()
     x = (
         (
-            torch.randn(16, 5120, generator=torch.Generator().manual_seed(rank + 3))
+            torch.randn(48, 5120, generator=torch.Generator().manual_seed(rank + 3))
             * 0.05
         )
         .bfloat16()
@@ -268,7 +268,7 @@ def test_v41_eplb_loaded_slots_migration_and_graph(group):
 
     def forward():
         routes = block._compute_topk_output(x, None)
-        return block._forward_routed_experts(x, routes, world * 16, 16, True)
+        return block._forward_routed_experts(x, routes, world * 48, 48, True)
 
     for _ in range(2):
         baseline = forward()
@@ -280,7 +280,7 @@ def test_v41_eplb_loaded_slots_migration_and_graph(group):
     graph.replay()
     torch.npu.synchronize()
     torch.testing.assert_close(replay_output, baseline, atol=0, rtol=0)
-    # Count only eight live rows, not the graph's sixteen-row capacity.
+    # Count only eight live rows, not the graph's full capacity.
     placement.reset_load()
     placement.load_rows.mask[8:].fill_(False)
     graph.replay()

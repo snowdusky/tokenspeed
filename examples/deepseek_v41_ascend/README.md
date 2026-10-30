@@ -67,6 +67,10 @@ V4.1 FlatQuant W4A4 supports the standard expert placement and online EPLB
 controller. MC2 selects a local-row load mask so idle and padded rows do not
 inflate expert counts; other transports keep their existing recorder layout.
 The model binds MC2's dedicated communicator before expert weight processing.
+MC2 dispatches the full rank-consistent row capacity once per layer, including
+idle ranks, and combines once after GMM. Size `HCCL_BUFFSIZE` for the largest
+prefill or graph-capture capacity and the physical expert count, including
+redundant slots; the provider does not split batches to fit a smaller window.
 For cross-node MC2, use EP32, EP64 or EP128 with MoE TP1. Start
 with one redundant expert slot per EP rank: `--ep-num-redundant-experts`
 counts extra slots across the entire EP group, not per device. For EP64:
@@ -90,3 +94,25 @@ DSpark's draft keeps its own original expert layout.
 Compare EPLB on/off at equal EP size, input/output length and offered load.
 Include counter and migration overhead in sustained throughput, and record
 DSpark acceptance rather than assuming it stays constant as EP grows.
+
+## Validated runtime snapshot
+
+This branch includes full-batch MC2, the W4A4 temporary-buffer lifetime fix,
+per-result asynchronous copy-stream completion, and the Ascend activation,
+metadata and DSpark registrations. The MC2 kernel requires the matching
+compact route-encoding implementation; it is not supplied by this Python
+repository or by changing `HCCL_BUFFSIZE`. The tested BF16 tiling-256 object
+has SHA256 `0e02a6811e8e0d3976e67407fdc7f4248657f470c9942b69b26816ac9ecbbffd`.
+
+Recorded validation for this runtime includes 64-rank MC2 transport/graph
+regression at capacities up to 384 rows, 64-rank real W4A4 expert comparison
+against a frozen reference, and 256 output-copy completions with eager and
+graph producers, pending results and different thread device contexts.
+The corresponding tests live under `test/runtime/npu/`. These are device
+checks, not a complete model-accuracy evaluation.
+
+The EP8 recipe uses AllGather/ReduceScatter with `--all2all-backend none`;
+its measured 128K/1000 decode cost must not be attributed to MC2. Compare
+performance at identical topology, Engram placement, input/output lengths,
+per-card concurrency and graph sizes. In particular, an online EPLB result
+requires an actual applied placement and includes migration stalls.

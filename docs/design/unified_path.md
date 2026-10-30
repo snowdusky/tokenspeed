@@ -2263,3 +2263,20 @@ cache groups. Its eager and captured decode share metadata refresh and DCP
 partial-output reduction; SWA and compressor tails remain replicated. See
 [the V4.1 context-parallel contract](deepseek-v41-context-parallelism.md) for
 ownership, graph lifetime and supported configurations.
+
+### Expert load row layout
+
+The selected all-to-all backend declares whether routing counters consume
+local or gathered rows. Expert placement binds this layout before routers
+retain the shared mask. Existing backends keep their gathered-row behavior;
+Ascend MC2 counts local inputs before dispatch. Padding updates and graph
+buffer ownership continue through the existing expert load recording flow.
+
+### Ascend output-copy completion
+
+Each pending NPU result leases its own copy stream. That stream waits for the
+producer before copying tokens and lengths to the host; the producer waits
+for the copy before reusing its scratch outputs. Host commit synchronizes
+only the leased stream under its owning device context, then returns it to
+the pool. Keep source tensors alive until completion. Waiting on the producer
+can include later collectives whose peers have not been dispatched yet.

@@ -47,6 +47,9 @@ pytestmark = pytest.mark.skipif(not current_platform().is_npu, reason="requires 
 
 @torch.inference_mode()
 def test_backbone_prefill_and_live_decode_acl_replay(tmp_path):
+    from tokenspeed_kernel.plugins import discover_plugins
+
+    discover_plugins()
     torch.manual_seed(71)
     settings = vars(_config()).copy()
     settings.update(
@@ -55,7 +58,7 @@ def test_backbone_prefill_and_live_decode_acl_replay(tmp_path):
         num_attention_heads=2,
         o_groups=2,
         q_lora_rank=128,
-        index_n_heads=2,
+        index_n_heads=32,
         index_head_dim=128,
         rms_norm_eps=1e-6,
         max_position_embeddings=512,

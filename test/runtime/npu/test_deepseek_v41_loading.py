@@ -304,10 +304,21 @@ def test_engram_byte_table_and_acl_replay(width, strided):
 @pytest.mark.parametrize("zero_gate", [False, True])
 @torch.inference_mode()
 def test_engram_gate_matches_cpu_and_captures(zero_gate):
-    from test.runtime.test_deepseek_v41_engram import _model, _weights
+    from test.runtime.test_deepseek_v41_engram import _config, _mapping, _weights
+
+    from tokenspeed.runtime.models.deepseek_v41_ascend910 import Ascend910Engram
 
     torch.manual_seed(41)
-    model = _model("npu", None)
+    model = Ascend910Engram(
+        _config(),
+        1,
+        _mapping(0, 1, 1),
+        None,
+        "model.layers.1.engram",
+        "npu",
+        False,
+        "gpu",
+    )
     codes, scales = _weights(72, 32)
     model.embed.weight_loader(model.embed.weight, codes)
     model.embed.weight_loader(model.embed.scale, scales)
@@ -341,19 +352,21 @@ def test_engram_gate_matches_cpu_and_captures(zero_gate):
         torch.testing.assert_close(actual[~mask], hidden[~mask], atol=0, rtol=0)
 
     for _ in range(3):
-        eager = model(hidden, ids, mask)
+        eager = model(hidden, ids, mask, global_num_tokens=None)
     check(eager)
     torch.npu.synchronize()
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph, auto_dispatch_capture=True):
-        captured = model(hidden, ids, mask)
+        captured = model(hidden, ids, mask, global_num_tokens=None)
     hidden.normal_()
     ids.copy_(torch.randint_like(ids, 72))
     mask.logical_not_()
     graph.replay()
     torch.npu.synchronize()
     check(captured)
-    torch.testing.assert_close(captured, model(hidden, ids, mask), atol=0, rtol=0)
+    torch.testing.assert_close(
+        captured, model(hidden, ids, mask, global_num_tokens=None), atol=0, rtol=0
+    )
 
 
 @torch.inference_mode()
@@ -391,8 +404,7 @@ def test_registered_draft_checkpoint_prepares_910_components(monkeypatch):
     from test.runtime.test_deepseek_v41_dspark import _draft_checkpoint, _draft_config
     from test.runtime.test_deepseek_v41_model import _quant
 
-    from transformers import PretrainedConfig
-
+    from tokenspeed.runtime.configs.deepseek_v41_config import DeepseekV41Config
     from tokenspeed.runtime.distributed import Mapping
     from tokenspeed.runtime.layers.linear import LinearBase
     from tokenspeed.runtime.layers.moe import utils
@@ -412,7 +424,11 @@ def test_registered_draft_checkpoint_prepares_910_components(monkeypatch):
     try:
         torch.set_default_dtype(torch.bfloat16)
         with torch.device("npu"):
-            adapter = cls(PretrainedConfig(text_config=config), mapping, _quant())
+            adapter = cls(
+                DeepseekV41Config(text_config=vars(config)),
+                mapping,
+                _quant(),
+            )
     finally:
         torch.set_default_dtype(previous)
     checkpoint = _draft_checkpoint(adapter.model)

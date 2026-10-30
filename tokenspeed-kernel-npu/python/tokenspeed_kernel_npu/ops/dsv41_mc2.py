@@ -23,6 +23,9 @@
 Route IDs and FP32 weights travel as raw bits beside BF16 activations. MC2
 does not round those weights or apply them after Down: grouped_experts applies
 them at the model's pre-Down boundary. All counts stay on the device.
+Each forward uses one dispatch/combine pair for the full rank-consistent
+capacity. HCCL_BUFFSIZE must cover the native hierarchy's maximum capacity,
+including prefill and graph capture; this provider does not split batches.
 """
 
 from dataclasses import dataclass
@@ -31,11 +34,6 @@ import torch
 from tokenspeed_kernel_npu._triton import tl, triton
 from tokenspeed_kernel_npu.ops.dsv41_w4a4 import grouped_experts
 from tokenspeed_kernel_npu.ops.dsv41_w4a4 import process_weights as prepare_experts
-
-# Bound each sender's burst: concentrated routes stall the native hierarchy
-# with larger batches even when its communication window has enough space.
-# Larger forwards split within the provider, not the scheduler.
-_MAX_DISPATCH_ROWS = 16
 
 
 @triton.jit
@@ -110,10 +108,6 @@ class MC2Transport:
     hidden_size: int
     top_k: int
 
-    @property
-    def max_dispatch_rows(self):
-        return _MAX_DISPATCH_ROWS
-
     def arguments(self, max_rows):
         return dict(
             group_ep=self.group,
@@ -131,12 +125,9 @@ class MC2Transport:
 
     def dispatch(self, x, ids, weights, *, max_rows):
         """Return contiguous expert rows, exact route weights and a combine handle."""
-        if not 0 <= max_rows <= self.max_dispatch_rows:
-            raise ValueError(
-                f"MC2 dispatch requires a row capacity between 0 and {self.max_dispatch_rows}"
-            )
         if (
-            x.shape[0] > max_rows
+            max_rows < 0
+            or x.shape[0] > max_rows
             or ids.shape != weights.shape
             or ids.shape != (x.shape[0], self.top_k)
         ):
@@ -284,18 +275,13 @@ def moe_apply(
     if max_num_tokens_per_gpu is None or max_num_tokens_per_gpu < x.shape[0]:
         raise ValueError("MC2 needs a rank-consistent capacity covering all local rows")
     transport = plan["mc2_transport"]
-    outputs = []
-    capacity = max(1, max_num_tokens_per_gpu)
-    # All ranks execute the same number of collectives, including ranks whose
-    # local slice is empty. Token quantization and routing remain independent.
-    for start in range(0, capacity, transport.max_dispatch_rows):
-        end = min(start + transport.max_dispatch_rows, capacity)
-        rows, weights, counts, handle = transport.dispatch(
-            x[start:end],
-            topk_ids[start:end],
-            topk_weights[start:end],
-            max_rows=end - start,
-        )
-        output = grouped_experts(rows, weights, counts, w=w, plan=plan)
-        outputs.append(transport.combine(output, handle))
-    return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
+    # One collective pair covers the full rank-consistent capacity, including
+    # idle ranks. The communication window must cover that capacity.
+    rows, weights, counts, handle = transport.dispatch(
+        x,
+        topk_ids,
+        topk_weights,
+        max_rows=max_num_tokens_per_gpu,
+    )
+    output = grouped_experts(rows, weights, counts, w=w, plan=plan)
+    return transport.combine(output, handle)

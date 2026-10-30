@@ -212,10 +212,25 @@ def expand_active_mxfp4_experts(weight, scales, counts, expert_ids):
 
 @triton.jit
 def _mxfp8_embedding(
-    W, S, IDs, Y, W0, S0, START, END, ROWS, D: tl.constexpr, TILE: tl.constexpr
+    W,
+    S,
+    IDs,
+    Y,
+    W0,
+    S0,
+    ID_COLS,
+    ID0,
+    ID1,
+    START,
+    END,
+    ROWS,
+    D: tl.constexpr,
+    TILE: tl.constexpr,
 ):
     for row in range(tl.program_id(0), ROWS, tl.num_programs(0)):
-        index = tl.load(IDs + row).to(tl.int64)
+        index = tl.load(IDs + (row // ID_COLS) * ID0 + (row % ID_COLS) * ID1).to(
+            tl.int64
+        )
         col = tl.arange(0, TILE)
         valid = (index >= START) & (index < END)
         local = tl.where(valid, index - START, 0)
@@ -231,14 +246,17 @@ def mxfp8_embedding(weight, scales, indices, row_start, row_end):
         (*indices.shape, width), dtype=torch.bfloat16, device=weight.device
     )
     if out.numel():
+        ids = indices if indices.ndim == 2 else indices.contiguous().view(-1, 1)
         with torch.npu.device(weight.device):
             _mxfp8_embedding[(min(1024, indices.numel()),)](
                 weight,
                 scales,
-                indices,
+                ids,
                 out,
                 weight.stride(0),
                 scales.stride(0),
+                ids.shape[1],
+                *ids.stride(),
                 row_start,
                 row_end,
                 indices.numel(),

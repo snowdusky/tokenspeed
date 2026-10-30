@@ -166,6 +166,9 @@ def grouped_experts(x, route_weights, counts, *, w, plan):
         (x.shape[0], 2 * w.intermediate_size), device=x.device, dtype=x.dtype
     )
     grouped_w4a4(packed, weights.w13, state.scale13, token_scale, counts, gate_up)
+    # Release intermediates after their last same-stream consumer.
+    # Full-batch MC2 capacity makes retaining them through Down expensive.
+    del packed, token_scale
     hidden = torch.empty(
         (x.shape[0], w.intermediate_size), device=x.device, dtype=x.dtype
     )
@@ -184,7 +187,9 @@ def grouped_experts(x, route_weights, counts, *, w, plan):
         multibuffer=False,
         enable_fp_fusion=False,
     )
+    del gate_up
     packed, token_scale = quantize(hidden, weights.second)
+    del hidden
     out = torch.empty_like(x)
     return grouped_w4a4(packed, weights.w2, state.scale2, token_scale, counts, out)
 

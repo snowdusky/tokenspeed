@@ -57,3 +57,14 @@ def test_shared_expert_activation_matches_reference(rows, limit):
         gate_up, _ = model.gate_up_proj(x)
         expected, _ = model.down_proj(model.act_fn.forward_native(gate_up))
         torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-2)
+
+
+@torch.no_grad()
+def test_general_bf16_swiglu_retains_the_standard_npu_kernel():
+    import torch_npu
+    from tokenspeed_kernel.ops.activation import silu_and_mul
+
+    x = torch.randn((32, 256), dtype=torch.bfloat16, device="npu")
+    expected = torch_npu.npu_swiglu(x, dim=-1)
+    actual = silu_and_mul(x)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
