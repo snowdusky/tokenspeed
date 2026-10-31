@@ -53,13 +53,13 @@ def transport():
     dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("capacity", [17, 24, 48, 96, 256, 384])
+@pytest.mark.parametrize("capacity", [1, 6, 12, 13, 17, 24, 48, 96, 256, 384])
 @pytest.mark.parametrize("routing", ["balanced", "hot"])
 @torch.no_grad()
 def test_mc2_full_batch_roundtrip_and_graph(transport, capacity, routing):
     rank = transport.rank
     # Include idle and partially filled ranks in the same collective.
-    rows = 0 if rank % 4 == 0 else capacity - rank % 3
+    rows = 0 if rank % 4 == 0 else max(0, capacity - rank % 3)
     row_values = (
         (torch.arange(rows, device="npu", dtype=torch.int32) * 7 + rank * 11) % 31 - 15
     ).bfloat16()
@@ -79,6 +79,24 @@ def test_mc2_full_batch_roundtrip_and_graph(transport, capacity, routing):
             .contiguous()
         )
     weights = torch.full((rows, 6), 0.125, dtype=torch.float32, device="npu")
+
+    expected_counts = torch.zeros(transport.experts, dtype=torch.int64)
+    experts_per_rank = transport.experts // transport.world_size
+    for source in range(transport.world_size):
+        active = 0 if source % 4 == 0 else max(0, capacity - source % 3)
+        if routing == "balanced":
+            source_ids = (torch.arange(active * 6) + source * 19) % transport.experts
+        else:
+            source_ids = torch.tensor([41, 66, 80, 178, 190, 201]).repeat(active)
+        padded_ids = (
+            (torch.arange(6) + source * experts_per_rank) % transport.experts
+        ).repeat(capacity - active)
+        expected_counts += torch.bincount(
+            torch.cat((source_ids, padded_ids)), minlength=transport.experts
+        )
+    expected_counts = expected_counts[
+        rank * experts_per_rank : (rank + 1) * experts_per_rank
+    ]
 
     def forward():
         expanded, route_weights, counts, handle = transport.dispatch(
@@ -101,7 +119,100 @@ def test_mc2_full_batch_roundtrip_and_graph(transport, capacity, routing):
         torch.testing.assert_close(actual, x * 0.75, atol=0, rtol=0)
         # Includes zero-weight padding, which must survive Dispatch but make
         # no contribution to the caller's output.
-        total = counts.sum().clone()
-        dist.all_reduce(total)
-        assert total.item() == capacity * transport.world_size * 6
+        torch.testing.assert_close(
+            counts.cpu().to(torch.int64), expected_counts, atol=0, rtol=0
+        )
+    graph.reset()
+
+
+@pytest.mark.parametrize("capacity", [6, 12, 13])
+@torch.no_grad()
+def test_mc2_refreshes_routes_and_exact_weight_bits(transport, capacity):
+    rank = transport.rank
+    experts_per_rank = transport.experts // transport.world_size
+    rows = 0 if rank % 3 == 0 else max(0, capacity - rank % 3)
+    original = (
+        (
+            torch.arange(rows, device="npu")[:, None] * 5
+            + torch.arange(5120, device="npu")[None, :] * 7
+            + rank * 3
+        )
+        % 43
+        - 21
+    ).bfloat16()
+    x = original.clone()
+    ids = torch.empty((rows, 6), dtype=torch.int32, device="npu")
+    weights = torch.empty((rows, 6), dtype=torch.float32, device="npu")
+
+    def refresh(phase):
+        row = torch.arange(rows, device="npu")[:, None]
+        slot = torch.arange(6, device="npu")[None, :]
+        ids.copy_((rank * 7 + row * 17 + slot * 61 + phase * 5) % transport.experts)
+        weights.copy_(0.12345 + row * 0.015625 + slot * 0.0625 + phase * 0.0078125)
+        x.copy_(original * (phase + 1))
+
+    def forward():
+        expanded, route_weights, counts, handle = transport.dispatch(
+            x, ids, weights, max_rows=capacity
+        )
+        row = torch.arange(expanded.shape[0], device="npu")
+        expert = (row[:, None] >= counts.cumsum(0)[None, :]).sum(1)
+        expert = expert + rank * experts_per_rank
+        contribution = (
+            expanded.float()
+            * route_weights[:, None]
+            * (expert % 7 + 1).float()[:, None]
+        ).bfloat16()
+        return transport.combine(contribution, handle), route_weights, counts
+
+    refresh(0)
+    for _ in range(2):
+        forward()
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph, auto_dispatch_capture=True):
+        actual, route_weights, counts = forward()
+    for phase in range(3):
+        refresh(phase)
+        graph.replay()
+        torch.npu.synchronize()
+        cpu_x, cpu_ids, cpu_weights = x.cpu(), ids.cpu(), weights.cpu()
+        expected = torch.zeros_like(cpu_x, dtype=torch.float32)
+        for slot in range(6):
+            contribution = (
+                cpu_x.float()
+                * cpu_weights[:, slot, None]
+                * (cpu_ids[:, slot, None] % 7 + 1).float()
+            ).bfloat16()
+            expected += contribution.float()
+        torch.testing.assert_close(actual.cpu(), expected.bfloat16(), atol=0, rtol=0)
+        expected_weights = []
+        for expert in range(rank * experts_per_rank, (rank + 1) * experts_per_rank):
+            for source in range(transport.world_size):
+                active = 0 if source % 3 == 0 else capacity - source % 3
+                row = torch.arange(active)[:, None]
+                slot = torch.arange(6)[None, :]
+                source_ids = (
+                    source * 7 + row * 17 + slot * 61 + phase * 5
+                ) % transport.experts
+                source_weights = (
+                    0.12345 + row * 0.015625 + slot * 0.0625 + phase * 0.0078125
+                ).float()
+                selected = source_weights[source_ids == expert]
+                expected_weights.extend(selected.tolist())
+                padded_ids = (
+                    torch.arange(6) + source * experts_per_rank
+                ) % transport.experts
+                expected_weights.extend(
+                    [0.0] * ((capacity - active) * int((padded_ids == expert).sum()))
+                )
+        expected_weights = torch.tensor(expected_weights, dtype=torch.float32)
+        active = int(counts.sum().item())
+        assert active == expected_weights.numel()
+        torch.testing.assert_close(
+            route_weights[:active].cpu().view(torch.int32),
+            expected_weights.view(torch.int32),
+            atol=0,
+            rtol=0,
+        )
     graph.reset()

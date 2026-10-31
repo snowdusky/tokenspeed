@@ -27,6 +27,12 @@ records every Python package mutation needed by this Ascend path, including the
 MXFP8 embedding lookup accepts strided two-dimensional indices directly,
 including per-layer Engram hash slices, without copying them to a contiguous buffer.
 
+The V4.1 MC2 transport carries route IDs and FP32 weight bits beside BF16
+activations. Packing uses wide feature tiles; unpacking copies several rows per
+tile while reading the active expert counts on the device. Eager execution and
+graph replay use the same kernels, including zero-weight padding and idle ranks.
+The transport preserves the order and precision of expert contributions.
+
 TokenSpeed applications should continue to import operators from
 `tokenspeed-kernel`; it owns registration and dispatch to this package.
 

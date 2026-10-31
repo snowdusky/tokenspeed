@@ -68,6 +68,7 @@ def _pack(
         tl.store(Bits + row * ((H + 64) // 2) + H // 2 + k, metadata)
 
 
+# Batch rows to amortize count/metadata work without a host read of active rows.
 @triton.jit
 def _unpack(
     X,
@@ -80,6 +81,8 @@ def _unpack(
     E: tl.constexpr,
     R,
     BLOCK: tl.constexpr,
+    BATCH: tl.constexpr,
+    GRID: tl.constexpr,
 ):
     e = tl.arange(0, triton.next_power_of_2(E))
     counts = tl.load(Counts + e, e < E, 0).to(tl.int32)
@@ -87,16 +90,41 @@ def _unpack(
     active = tl.sum(counts)
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     ks = tl.arange(0, triton.next_power_of_2(K))
-    for row in range(tl.program_id(0), active, 32):
-        values = tl.load(X + row * (H + 64) + col, col < H, 0)
-        tl.store(Y + row * H + col, values, col < H)
+    rr = tl.arange(0, BATCH)
+    for first in range(tl.program_id(0) * BATCH, active, GRID * BATCH):
+        row = first + rr
+        values = tl.load(
+            X + row[:, None] * (H + 64) + col[None, :],
+            (row[:, None] < active) & (col[None, :] < H),
+            0,
+        )
+        tl.store(
+            Y + row[:, None] * H + col[None, :],
+            values,
+            (row[:, None] < active) & (col[None, :] < H),
+        )
         if tl.program_id(1) == 0:
-            expert = tl.sum(((row >= ends) & (e < E)).to(tl.int32)) + R * E
-            ids = tl.load(Bits + row * ((H + 64) // 2) + H // 2 + ks, ks < K, -1)
+            expert = (
+                tl.sum(
+                    ((row[:, None] >= ends[None, :]) & (e[None, :] < E)).to(tl.int32), 1
+                )
+                + R * E
+            )
+            ids = tl.load(
+                Bits + row[:, None] * ((H + 64) // 2) + H // 2 + ks[None, :],
+                (row[:, None] < active) & (ks[None, :] < K),
+                -1,
+            )
             weights = tl.load(
-                Bits + row * ((H + 64) // 2) + H // 2 + K + ks, ks < K, 0
+                Bits + row[:, None] * ((H + 64) // 2) + H // 2 + K + ks[None, :],
+                (row[:, None] < active) & (ks[None, :] < K),
+                0,
             ).to(tl.float32, bitcast=True)
-            tl.store(Weights + row, tl.sum(tl.where(ids == expert, weights, 0)))
+            tl.store(
+                Weights + row,
+                tl.sum(tl.where(ids == expert[:, None], weights, 0), 1),
+                row < active,
+            )
 
 
 @dataclass(frozen=True)
@@ -167,7 +195,7 @@ class MC2Transport:
             padded_weights[:original_rows].copy_(weights)
             x, ids, weights = padded_x, padded_ids, padded_weights
         carrier = x.new_empty((x.shape[0], self.hidden_size + 64))
-        _pack[(x.shape[0], triton.cdiv(self.hidden_size, 256))](
+        _pack[(x.shape[0], triton.cdiv(self.hidden_size, 8192))](
             x,
             ids,
             weights,
@@ -178,7 +206,7 @@ class MC2Transport:
             x.stride(0),
             ids.stride(0),
             weights.stride(0),
-            256,
+            8192,
             num_warps=1,
             multibuffer=False,
             enable_fp_fusion=False,
@@ -195,7 +223,7 @@ class MC2Transport:
         )
         sorted_x = x.new_empty((result[0].shape[0], self.hidden_size))
         sorted_weights = weights.new_empty((result[0].shape[0],))
-        _unpack[(32, triton.cdiv(self.hidden_size, 256))](
+        _unpack[(48, triton.cdiv(self.hidden_size, 8192))](
             result[0],
             result[0].view(torch.int32),
             result[3],
@@ -205,7 +233,9 @@ class MC2Transport:
             self.top_k,
             self.experts // self.world_size,
             self.rank,
-            256,
+            8192,
+            4,
+            48,
             num_warps=1,
             multibuffer=False,
             enable_fp_fusion=False,
