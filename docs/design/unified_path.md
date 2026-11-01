@@ -408,9 +408,6 @@ owners mark from the host's padded/live counts before a padded replay — the
 decode graph in `ForwardStepRunner`, the bucket in `PrefillGraph.replay` —
 and clear right after it, on the same stream. Eager forwards are unpadded
 and read the all-True mask; the router counts a route if and only if its row is marked.
-For expert-owned all-to-all dispatch, the mask selects this rank's input
-segment instead of the gathered segments. Idle ranks count no filler routes;
-attention TP shards count only their local share of the live prefix.
 
 ### Pointer-stable per-bs views from one builder
 
@@ -714,9 +711,6 @@ respects both deterministic and batch-invariant collective settings. Empty
 consumer rows carry no deferred post. Cache-only narrowing completes the incoming
 post before the global KV producer and skips new HC mixes; idle ranks still
 participate in expert-owned dispatch/combine, which never defers another reduction.
-Idle ranks use the same layer entry as active ranks: a device-sharded Engram
-table still gathers peer hashes and reduces embeddings when its local row count
-is zero. Skipping that entry would mismatch Engram and expert collectives.
 
 ### Prefill requests without generated outputs
 
@@ -2263,20 +2257,3 @@ cache groups. Its eager and captured decode share metadata refresh and DCP
 partial-output reduction; SWA and compressor tails remain replicated. See
 [the V4.1 context-parallel contract](deepseek-v41-context-parallelism.md) for
 ownership, graph lifetime and supported configurations.
-
-### Expert load row layout
-
-The selected all-to-all backend declares whether routing counters consume
-local or gathered rows. Expert placement binds this layout before routers
-retain the shared mask. Existing backends keep their gathered-row behavior;
-Ascend MC2 counts local inputs before dispatch. Padding updates and graph
-buffer ownership continue through the existing expert load recording flow.
-
-### Ascend output-copy completion
-
-Each pending NPU result leases its own copy stream. That stream waits for the
-producer before copying tokens and lengths to the host; the producer waits
-for the copy before reusing its scratch outputs. Host commit synchronizes
-only the leased stream under its owning device context, then returns it to
-the pool. Keep source tensors alive until completion. Waiting on the producer
-can include later collectives whose peers have not been dispatched yet.
