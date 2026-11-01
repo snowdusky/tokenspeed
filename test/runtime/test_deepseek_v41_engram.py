@@ -456,11 +456,9 @@ def test_gate_matches_reference_and_mask_is_identity():
     gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
     gate[~mask] = 0
     expected = (h + gate.unsqueeze(-1) * value.unsqueeze(-2)).to(hidden.dtype)
+    torch.testing.assert_close(model(hidden, ids, mask), expected, rtol=0, atol=0)
     torch.testing.assert_close(
-        model(hidden, ids, mask, global_num_tokens=None), expected, rtol=0, atol=0
-    )
-    torch.testing.assert_close(
-        model(hidden, ids, mask, global_num_tokens=None)[~mask],
+        model(hidden, ids, mask)[~mask],
         hidden[~mask],
         rtol=0,
         atol=0,
@@ -471,7 +469,7 @@ def test_gate_matches_reference_and_mask_is_identity():
         hidden.dtype
     )
     torch.testing.assert_close(
-        model(hidden, ids, torch.ones_like(mask), global_num_tokens=None),
+        model(hidden, ids, torch.ones_like(mask)),
         expected,
         rtol=0,
         atol=0,
@@ -576,12 +574,12 @@ def test_cuda_quantized_projection_forward():
     ids = torch.arange(24, device="cuda:0").reshape(4, 6)
     hidden = torch.randn(4, 4, 32, dtype=torch.bfloat16, device="cuda:0")
     mask = torch.ones(4, dtype=torch.bool, device="cuda:0")
-    actual = model(hidden, ids, mask, global_num_tokens=None)
+    actual = model(hidden, ids, mask)
     reference = _model("cuda:0", None)
     reference.embed.weight_loader(reference.embed.weight, codes)
     reference.embed.weight_loader(reference.embed.scale, scales)
     reference.wkv.weight.data.copy_((weight.float() / 64).to(torch.bfloat16))
-    expected = reference(hidden, ids, mask, global_num_tokens=None)
+    expected = reference(hidden, ids, mask)
     torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
     # Hopper uses BF16 projection weights; other supported GPUs retain FP8.
     expected_dtype = (
@@ -589,18 +587,16 @@ def test_cuda_quantized_projection_forward():
     )
     assert model.wkv.weight.dtype == expected_dtype
     for _ in range(2):
-        model(hidden, ids, mask, global_num_tokens=None)
+        model(hidden, ids, mask)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = model(hidden, ids, mask, global_num_tokens=None)
+        captured = model(hidden, ids, mask)
     hidden.mul_(0.5)
     mask[1] = False
     graph.replay()
-    torch.testing.assert_close(
-        captured, model(hidden, ids, mask, global_num_tokens=None), rtol=0, atol=0
-    )
-    empty = model(hidden[:0], ids[:0], mask[:0], global_num_tokens=None)
+    torch.testing.assert_close(captured, model(hidden, ids, mask), rtol=0, atol=0)
+    empty = model(hidden[:0], ids[:0], mask[:0])
     assert empty.shape == (0, 4, 32)
 
 
@@ -747,7 +743,7 @@ def test_local_snapshot_reference_parity():
         clamp_value=1e-6,
     )
     torch.testing.assert_close(
-        model(hidden, hash_ids, token_mask, global_num_tokens=None),
+        model(hidden, hash_ids, token_mask),
         namespace["forward"](ref_model, hidden, hash_ids, token_mask),
         rtol=0,
         atol=0,

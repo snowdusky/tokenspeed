@@ -549,41 +549,18 @@ def test_empty_decoder_rows_complete_hc_and_preserve_ep_participation(
             layer._forward_ffn(hidden[:, 0, :], image_mask, ctx, defer_reduce=True)
 
 
-@pytest.mark.parametrize("shared_engram", [False, True])
+@pytest.mark.parametrize("with_engram", [False, True])
 def test_idle_model_calls_every_ep_layer_with_completed_empty_state(
-    monkeypatch, shared_engram
+    monkeypatch, with_engram
 ):
-    from tokenspeed.runtime.distributed import comm_ops
-    from tokenspeed.runtime.models import deepseek_v41_engram as engram
-    from tokenspeed.runtime.models.deepseek_v41_parallel import EngramRowExchange
-
     monkeypatch.setattr(v41.DeepseekV41DecoderLayer, "moe_cls", _DenseFFN)
     config = _config()
-    if not shared_engram:
+    if not with_engram:
         config.engram_layer_ids = []
     model = DeepseekV41Model(config, _mapping(0, 1, 1), None, "model", False, "gpu")
     model.mapping = SimpleNamespace(attn=SimpleNamespace(has_dp=True))
     calls = []
-    embedding_rows = []
-
-    def gather_rows(local, group, counts):
-        assert local.shape == (0, 6) and counts == [0, 5]
-        return torch.zeros((5, 6), dtype=torch.int64)
-
-    def reduce_embeddings(values, *, group, backend, op):
-        # Simulate the absent peer's table contribution. Idle ranks must
-        # exchange all peer rows before returning their empty local view.
-        embedding_rows.append(values.shape)
-        return values + 1
-
-    monkeypatch.setattr(comm_ops, "token_all_gather_rows", gather_rows)
-    monkeypatch.setattr(engram, "all_reduce", reduce_embeddings)
     for layer in model.layers:
-        if layer.engram is not None:
-            layer.engram.row_exchange = EngramRowExchange(0, 2, 1, 0, (0, 1))
-            layer.engram.embed.tp_group = (0, 1)
-            layer.engram.embed.weight.data.zero_()
-            layer.engram.embed.scale.data.fill_(127)
         layer.ffn.owns_ep_communication = True
         monkeypatch.setattr(
             layer.comm_manager,
@@ -623,7 +600,6 @@ def test_idle_model_calls_every_ep_layer_with_completed_empty_state(
     )
     assert hidden.shape == (0, config.hidden_size) and captured is None
     assert calls == list(range(config.num_hidden_layers))
-    assert embedding_rows == [(5, 192)] * len(config.engram_layer_ids)
 
 
 @pytest.mark.parametrize("attention_dp", [False, True])
@@ -3253,10 +3229,7 @@ def test_strict_checkpoint_load_tp4_ep4(monkeypatch, rank, prefixed, reverse, tm
                 layer.attn.wq_b.weight, codes.to(torch.bfloat16), rtol=0, atol=0
             )
         else:
-            storage_dtype = (
-                torch.uint8 if current_platform().is_npu else torch.float8_e4m3fn
-            )
-            assert layer.attn.wq_b.weight.dtype == storage_dtype
+            assert layer.attn.wq_b.weight.dtype == torch.float8_e4m3fn
             torch.testing.assert_close(
                 layer.attn.wq_b.weight.view(torch.uint8),
                 codes.view(torch.uint8),
@@ -3406,6 +3379,44 @@ def test_load_weights_rejects_engram_embed_in_iterator(monkeypatch):
         model.load_weights(weights.items())
 
 
+def test_shared_checkpoint_ignores_other_models_expert_placement(monkeypatch, tmp_path):
+    from tokenspeed.runtime.moe.expert_location import (
+        ExpertLocationMetadata,
+        get_global_expert_location_metadata,
+        set_global_expert_location_metadata,
+    )
+
+    config = _loader_config()
+    weights = _checkpoint(config)
+    previous = get_global_expert_location_metadata()
+    try:
+        set_global_expert_location_metadata(None)
+        reference = _loader_model(monkeypatch, config, 0, "cpu")
+        rest = _bind_engram_tables(reference, weights, tmp_path)
+        reference.load_weights(rest.items())
+        placement = ExpertLocationMetadata.from_physical_to_logical_map(
+            torch.tensor([[1, 0, 3, 2]]).repeat(config.num_hidden_layers, 1),
+            4,
+            ep_size=4,
+            ep_rank=0,
+            ep_rank_nodes=(0, 0, 0, 0),
+        )
+        set_global_expert_location_metadata(placement)
+        actual = _loader_model(monkeypatch, config, 0, "cpu")
+        rest = _bind_engram_tables(actual, weights, tmp_path)
+        actual.load_weights(rest.items())
+        expected = dict(reference.named_parameters())
+        for name, value in actual.named_parameters():
+            torch.testing.assert_close(
+                value.view(torch.uint8),
+                expected[name].view(torch.uint8),
+                atol=0,
+                rtol=0,
+            )
+    finally:
+        set_global_expert_location_metadata(previous)
+
+
 @pytest.mark.parametrize(
     "bad",
     [
@@ -3439,7 +3450,7 @@ def test_checkpoint_rejects_duplicate_alias_and_shapes(monkeypatch):
     with pytest.raises(TypeError, match="FP8 E4M3"):
         model.load_weights([(name, weights[name].bfloat16())])
     name = "layers.0.ffn.experts.0.w1.weight"
-    with pytest.raises(TypeError, match="packed FP4"):
+    with pytest.raises(TypeError, match="expected.*float4"):
         model.load_weights([(name, weights[name].bfloat16())])
     name = "layers.0.attn.wo_a.scale"
     with pytest.raises(TypeError, match="E8M0"):
@@ -3674,25 +3685,6 @@ def test_short_history_skips_query_projections_but_preserves_keys(
     assert bool(backend.global_writes) == (layer_id in (2, 20))
     if layer_id in (2, 20):
         assert backend.global_writes[layer_id][1].numel() > 0
-
-
-def test_language_model_exposes_prepared_expert_slots(monkeypatch):
-    config = _loader_config()
-    model = _loader_model(monkeypatch, config, rank=0, device="meta")
-    expected = {}
-    for index, layer in enumerate(model.model.layers):
-        weights = layer.ffn.experts
-        tensors = [weights.w13_weight, weights.w2_weight]
-        # Replace only the hardware provider's prepared-storage callback.
-        monkeypatch.setitem(
-            weights.plan, "expert_slot_tensors", lambda tensors=tensors: tensors
-        )
-        expected[index] = tensors
-    actual = model.routed_experts_weights_of_layer
-    assert actual.keys() == expected.keys()
-    for index, tensors in actual.items():
-        assert all(left is right for left, right in zip(tensors, expected[index]))
-    assert list(model._local_expert_ids(0)) == list(range(config.n_routed_experts // 4))
 
 
 @pytest.mark.parametrize(

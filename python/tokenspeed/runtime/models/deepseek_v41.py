@@ -25,9 +25,7 @@ duplicate and missing local text tensors, and reports explicit vision/draft skip
 Dense FP8 codes stay unchanged: 32x32 E8M0 scale rows expand losslessly to 1x32.
 On Hopper the dense projections load as BF16 weights instead -- codes widened on
 copy, scales folded in after loading, both exact -- and run the BF16 GEMM.
-Ascend-specific weight layouts and execution components are selected in
-``deepseek_v41_ascend910``; the checkpoint and forward contracts remain shared.
-Grouped wo_a is dequantized to BF16 after selecting this TP rank's rows.
+Only grouped wo_a is dequantized to BF16, after selecting this TP rank's rows.
 Engram tables load local FP8/E8M0 rows in bounded chunks without table conversion.
 The unquantized LM head follows the model loading dtype, including its logits.
 Packed routed experts use the V4 MoE loader, with zero-padded intermediate lanes
@@ -50,9 +48,6 @@ decoder's global KV for all rows. DSpark captures the kept rows and the model
 reports them as ``ctx.captured_rows``. PP and CP are not implemented.
 Attention and MoE TPxEP widths match, or fused EP keeps attention/dense/MoE
 TP1 rows local. Its dispatch exchanges actual counts after CED narrowing.
-On Ascend, TP can also split an output group: neighboring ranks assemble its
-heads before applying disjoint wo_a output rows. This preserves each complete
-dot product while allowing wider weight sharding without changing scheduling.
 
 The forward is four stages on one path -- ``encoder_forward`` (embedding and
 the layers below the candidate source, one row per token), ``narrowing_forward``
@@ -151,9 +146,7 @@ from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
 from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput
-from tokenspeed.runtime.layers.moe.utils import (
-    get_moe_backend,
-)
+from tokenspeed.runtime.layers.moe.utils import get_moe_backend
 from tokenspeed.runtime.layers.parameter import ModelWeightParameter
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config, Mxfp8Config
@@ -172,10 +165,7 @@ from tokenspeed.runtime.models.deepseek_v41_engram import (
 )
 from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MLP, DeepseekV4MoE
 from tokenspeed.runtime.models.deepseek_v41_vision import DeepseekV41Vision
-from tokenspeed.runtime.moe.expert_location import (
-    ModelConfigForExpertLocation,
-    get_global_expert_location_metadata,
-)
+from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
     VisionEmbedder,
@@ -1396,9 +1386,7 @@ class DeepseekV41MoE(DeepseekV4MoE):
             except NoKernelFoundError:
                 pass
             else:
-                return self._map_topk_output(
-                    StandardTopKOutput(topk_weights, topk_ids, None)
-                )
+                return StandardTopKOutput(topk_weights, topk_ids, None)
         return super()._compute_topk_output(hidden_states, image_mask)
 
 
@@ -1590,10 +1578,7 @@ class DeepseekV41DecoderLayer(nn.Module):
             raise ValueError("V4.1 attention requires an explicit forward mode")
         if hidden_states.shape[0] == 0:
             self._forward_ffn(
-                hidden_states[:, 0, :],
-                image_mask,
-                ctx,
-                defer_reduce=False,
+                hidden_states[:, 0, :], image_mask, ctx, defer_reduce=False
             )
             captured = hidden_states[:, 0, :] if capture_input else None
             return hidden_states, pre_mix, None, captured
@@ -1758,12 +1743,7 @@ class DeepseekV41DecoderLayer(nn.Module):
                         self.hc_eps,
                         self.hc_sinkhorn_iters,
                     )
-            x = self._forward_ffn(
-                x,
-                image_mask,
-                ctx,
-                defer_reduce=defer_moe,
-            )
+            x = self._forward_ffn(x, image_mask, ctx, defer_reduce=defer_moe)
             ffn_pre, post, comb = ffn_mixes
             if ffn_overlap:
                 for tensor in (ffn_pre, post, comb):
@@ -2142,6 +2122,9 @@ class DeepseekV41Model(nn.Module):
         backend.end_indexer_forward()
         return output
 
+    def _apply_engram(self, engram, hidden, hashes, mask, ctx):
+        return engram(hidden, hashes, mask)
+
     def _run_layer(
         self,
         layer: DeepseekV41DecoderLayer,
@@ -2159,11 +2142,12 @@ class DeepseekV41Model(nn.Module):
             if pending_post is not None:
                 hidden = pending_post.finish(hidden)
                 pending_post = None
-            hidden = layer.engram(
+            hidden = self._apply_engram(
+                layer.engram,
                 hidden,
                 state.hashes[:, layer.engram.layer_hash_index],
                 state.engram_token_mask,
-                global_num_tokens=ctx.global_num_tokens,
+                ctx,
             )
         hidden, pre_mix, pending_post, tap = layer(
             hidden,
@@ -2491,7 +2475,6 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         is_multimodal_active: bool,
         mm_attention_backend: str | None,
     ) -> None:
-        self.expert_placement = get_global_expert_location_metadata()
         super().__init__(
             config=config,
             mapping=mapping,
@@ -2522,18 +2505,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             self.vision_embedder = VisionEmbedder(encoder_mapping=mapping.vision)
             self.image_encoder = self.vision.embed_media
 
-    @property
-    def routed_experts_weights_of_layer(self):
-        return {
-            layer_id: layer.ffn.get_moe_routed_weights()
-            for layer_id, layer in enumerate(self.model.layers)
-        }
-
     def _local_expert_ids(self, layer_id: int):
-        if self.expert_placement is not None:
-            return self.expert_placement.local_slot_logical_experts(
-                layer_id, self.mapping.moe.ep_rank
-            )
         count = self.model.config.n_routed_experts // self.mapping.moe.ep_size
         start = self.mapping.moe.ep_rank * count
         return range(start, start + count)
@@ -2669,6 +2641,24 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             ".ffn.gate.e_score_correction_bias", ".ffn.gate.bias"
         )
 
+    def _is_expert_auxiliary_parameter(self, name):
+        return False
+
+    def _expert_loader_options(self, config):
+        return {"num_experts": config.n_routed_experts}
+
+    def _expert_tensor_format(self, config, n, k, field):
+        packing = 32 if field == "scale" else 2
+        allowed = (
+            (torch.uint8, torch.float8_e8m0fnu)
+            if field == "scale"
+            else (torch.int8, torch.uint8, torch.float4_e2m1fn_x2)
+        )
+        return (n, k // packing), allowed, packing
+
+    def _expert_storage_tensor(self, tensor):
+        return tensor.view(torch.uint8)
+
     def _checkpoint_targets(self) -> dict[str, tuple[str, int | None]]:
         """Map each required local checkpoint constituent, not just fused parameters.
 
@@ -2682,10 +2672,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             if name.startswith("vision."):
                 continue
             raw = self._checkpoint_name(name)
-            if re.fullmatch(
-                r"layers\.\d+\.ffn\.experts\.(w[12]_trans\.matrix_(left|right)|act_quantizer_w[12]\.clip_factor_a)",
-                raw,
-            ):
+            if self._is_expert_auxiliary_parameter(raw):
                 targets[raw] = (name, None)
             elif ".ffn.experts." in raw:
                 prefix, field = raw.split(".experts.")
@@ -2831,12 +2818,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 extra_names={},
             ),
             fused_schema=None,
-            num_experts=(
-                self.expert_placement.num_physical_experts
-                if self.expert_placement is not None
-                else config.n_routed_experts
-            ),
-            expert_placement=self.expert_placement,
+            **self._expert_loader_options(config),
             ep_rank=self.mapping.moe.ep_rank,
             ep_size=self.mapping.moe.ep_size,
             fused_gate_up_as_w13=False,
@@ -2871,51 +2853,23 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                     if expert[3] == "w2"
                     else (config.moe_intermediate_size, config.hidden_size)
                 )
-                bf16_experts = getattr(config, "expert_dtype", None) == "bf16"
-                int4_experts = getattr(config, "expert_dtype", None) == "int4"
-                if bf16_experts and expert[4] == "scale":
-                    raise ValueError(f"{raw_name}: BF16 experts must not have scales")
-                packing = (
-                    1
-                    if bf16_experts
-                    else 8 if int4_experts else 32 if expert[4] == "scale" else 2
-                )
-                expected = (
-                    (n,) if int4_experts and expert[4] == "scale" else (n, k // packing)
+                expected, allowed, packing = self._expert_tensor_format(
+                    config, n, k, expert[4]
                 )
                 if tuple(tensor.shape) != expected:
                     raise ValueError(
                         f"{raw_name}: expected {expected}, got {tuple(tensor.shape)}"
                     )
-                allowed = (
-                    (torch.bfloat16,)
-                    if bf16_experts
-                    else (
-                        ((torch.float32,) if expert[4] == "scale" else (torch.int32,))
-                        if int4_experts
-                        else (
-                            (torch.uint8, torch.float8_e8m0fnu)
-                            if expert[4] == "scale"
-                            else (torch.int8, torch.uint8, torch.float4_e2m1fn_x2)
-                        )
-                    )
-                )
                 if tensor.dtype not in allowed:
-                    storage = (
-                        "BF16"
-                        if bf16_experts
-                        else "packed INT4/FP32" if int4_experts else "packed FP4/E8M0"
-                    )
                     raise TypeError(
-                        f"{raw_name}: expected {storage}, got {tensor.dtype}"
+                        f"{raw_name}: expected {allowed}, got {tensor.dtype}"
                     )
                 if expert_id not in self._local_expert_ids(layer_id):
                     skipped["remote_expert"] += 1
                     continue
                 if name not in targets:
                     raise ValueError(f"Unexpected V4.1 expert tensor: {raw_name}")
-                if not bf16_experts and not int4_experts:
-                    tensor = tensor.view(torch.uint8)
+                tensor = self._expert_storage_tensor(tensor)
                 ffn = self.model.layers[layer_id].ffn
                 if ffn.use_mega_moe:
                     extra = ffn.experts.intermediate_size - config.moe_intermediate_size

@@ -273,10 +273,12 @@ class BaseCausalLM(nn.Module):
         self.capture_aux_hidden_states = True
 
         if layer_ids is None:
+
             num_layers = self.config.num_hidden_layers
             self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
 
         else:
+
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
@@ -394,10 +396,12 @@ class BaseCausalLM(nn.Module):
         loaded: set[str] = set()
 
         for name, loaded_weight in weights:
+
             if any(pattern in name for pattern in skip_patterns):
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
+
                 if weight_name not in name:
                     continue
 
@@ -416,6 +420,7 @@ class BaseCausalLM(nn.Module):
                 break
 
             else:
+
                 if name.endswith(".bias") and name not in params_dict:
                     continue
 

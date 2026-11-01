@@ -28,6 +28,7 @@ All compute continues through tokenspeed-kernel's registered operations.
 from __future__ import annotations
 
 import math
+import re
 from contextlib import nullcontext
 from copy import copy
 
@@ -46,7 +47,13 @@ from tokenspeed.runtime.layers.activation import SwigluArg
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
-from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat
+from tokenspeed.runtime.layers.moe.topk import (
+    ExpertLocationDispatchInfo,
+    StandardTopKOutput,
+    TopKOutputFormat,
+    record_expert_load,
+    topk_ids_logical_to_physical,
+)
 from tokenspeed.runtime.layers.moe.types import MoELayerSpec
 from tokenspeed.runtime.layers.moe.utils import (
     All2AllBackend,
@@ -66,14 +73,21 @@ from tokenspeed.runtime.models.deepseek_v41_dspark import (
 from tokenspeed.runtime.models.deepseek_v41_dspark import (
     DeepseekV41ForCausalLMDSpark as SharedDSparkForCausalLM,
 )
+from tokenspeed.runtime.models.deepseek_v41_dspark import (
+    _WindowAttention,
+)
 from tokenspeed.runtime.models.deepseek_v41_engram import RowShardedEngramEmbedding
-from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MLP
+from tokenspeed.runtime.models.deepseek_v41_moe import (
+    DeepseekV4MLP,
+    _deepseek_v4_routed_expert_quant_config,
+)
 from tokenspeed.runtime.models.deepseek_v41_parallel import (
     create_decoder_cpu_group,
     decoder_global_rows,
     replicated_rows_moe,
     supports_ascend_dp_moe,
 )
+from tokenspeed.runtime.moe.expert_location import get_global_expert_location_metadata
 from tokenspeed.runtime.utils.device_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -461,8 +475,61 @@ class Ascend910Experts(nn.Module):
 
 
 class Ascend910MoE(shared.DeepseekV41MoE):
-    experts_cls = Ascend910Experts
     shared_expert_cls = Ascend910MLP
+    supports_empty_rows = True
+
+    def __init__(self, config, mapping, quant_config, layer_index, prefix, aux_stream):
+        self.expert_placement = get_global_expert_location_metadata()
+        self.expert_dispatch = None
+        if self.expert_placement is not None:
+            if not self._placement_enabled(get_moe_backend()):
+                raise ValueError("V4.1 expert placement requires ascend_v41_w4a4")
+            if self.expert_placement.num_logical_experts != config.n_routed_experts:
+                raise ValueError("V4.1 expert placement has the wrong logical geometry")
+        super().__init__(config, mapping, quant_config, layer_index, prefix, aux_stream)
+        if self.expert_placement is not None:
+            self.expert_dispatch = ExpertLocationDispatchInfo.init_new(
+                layer_index,
+                global_server_args_dict["ep_dispatch_algorithm"],
+                self.expert_placement,
+                all_to_all_ep=self.experts.supports_all_to_all_ep,
+            )
+
+    @staticmethod
+    def routed_quant_config(config, quant_config):
+        if getattr(config, "expert_dtype", None) == "bf16":
+            return None, False
+        if getattr(config, "expert_dtype", None) == "int4":
+            from tokenspeed.runtime.layers.quantization.compressed_tensors.compressed_tensors import (
+                CompressedTensorsConfig,
+            )
+
+            return (
+                CompressedTensorsConfig.from_config(config.expert_quantization_config),
+                False,
+            )
+        return _deepseek_v4_routed_expert_quant_config(config, quant_config)
+
+    def _create_experts(self, **kwargs):
+        if self.expert_placement is not None:
+            kwargs["num_experts"] = self.expert_placement.num_physical_experts
+        kwargs["internal_activation_dtype_override"] = (
+            "int4" if getattr(self.config, "expert_dtype", None) == "int4" else None
+        )
+        return Ascend910Experts(**kwargs)
+
+    def _compute_topk_output(self, hidden_states, input_ids):
+        output = super()._compute_topk_output(hidden_states, input_ids)
+        if self.expert_dispatch is None:
+            return output
+        ids = topk_ids_logical_to_physical(
+            output.topk_ids, self.expert_dispatch, self.config.n_routed_experts
+        )
+        record_expert_load(self.expert_dispatch.load, ids)
+        return StandardTopKOutput(output.topk_weights, ids, output.router_logits)
+
+    def get_moe_routed_weights(self):
+        return self.experts.plan["expert_slot_tensors"]()
 
     def _replicate_dp_rows(self, mapping):
         return _replicate_moe_rows(mapping)
@@ -477,6 +544,10 @@ class Ascend910MoE(shared.DeepseekV41MoE):
 class Ascend910EngramEmbedding(RowShardedEngramEmbedding):
     device_weight_dtype = torch.uint8
 
+    def __init__(self, *args, **kwargs):
+        self._host_lookup = None
+        super().__init__(*args, **kwargs)
+
     def _register_host_for_gpu(self):
         if self._host_gpu_registered or not self.host_table:
             return
@@ -489,7 +560,11 @@ class Ascend910EngramEmbedding(RowShardedEngramEmbedding):
 
     def _lookup(self, indices):
         if not self.host_table:
-            return super()._lookup(indices)
+            from tokenspeed_kernel.ops.embedding import mxfp8_embedding
+
+            return mxfp8_embedding(
+                self.weight, self.scale, indices, self.row_start, self.row_end
+            )
         if self._host_lookup is None:
             raise RuntimeError("Host Engram mapping must be prepared before forward")
         return self._host_lookup(indices.to(torch.int64).contiguous())
@@ -498,17 +573,41 @@ class Ascend910EngramEmbedding(RowShardedEngramEmbedding):
 class Ascend910Engram(shared.DeepseekV41Engram):
     embedding_cls = Ascend910EngramEmbedding
 
-    def _table_mapping(self, mapping, device, host_table):
+    def __init__(self, *args, **kwargs):
+        self.row_exchange = None
+        super().__init__(*args, **kwargs)
+
+    def _embedding_mapping(self, config, mapping, device, host_table):
         from tokenspeed.runtime.models.deepseek_v41_parallel import (
             resolve_engram_table_mapping,
         )
 
-        return resolve_engram_table_mapping(
+        tables, self.row_exchange = resolve_engram_table_mapping(
             mapping,
             global_server_args_dict["engram_tp_size"],
             device_type="npu",
             host_table=host_table,
         )
+        if self.row_exchange is not None and any(
+            i >= config.candidate_source_layer_id for i in config.engram_layer_ids
+        ):
+            raise ValueError("Shared Engram table rows must precede CED narrowing")
+        return tables
+
+    def forward(self, hidden_states, hash_ids, token_mask, *, global_num_tokens):
+        self._check_input_shapes(hidden_states, hash_ids, token_mask)
+        if hidden_states.numel() == 0 and self.row_exchange is None:
+            return hidden_states
+        local_rows = hash_ids.shape[0]
+        offset = 0
+        if self.row_exchange is not None:
+            hash_ids, offset = self.row_exchange.gather(hash_ids, global_num_tokens)
+        embeddings = self.embed(hash_ids)
+        if self.row_exchange is not None:
+            embeddings = embeddings[offset : offset + local_rows]
+        if hidden_states.numel() == 0:
+            return hidden_states
+        return self._apply_embeddings(hidden_states, embeddings.flatten(-2), token_mask)
 
     def _signed_magnitude(self, dot, magnitude):
         # copysign falls back to CPU on 910; preserve negative zero with the FP32 sign bit.
@@ -535,6 +634,9 @@ class Ascend910DecoderLayer(shared.DeepseekV41DecoderLayer):
 class Ascend910Model(shared.DeepseekV41Model):
     layer_cls = Ascend910DecoderLayer
     dense_quant_config = staticmethod(dense_quant_config)
+
+    def _apply_engram(self, engram, hidden, hashes, mask, ctx):
+        return engram(hidden, hashes, mask, global_num_tokens=ctx.global_num_tokens)
 
     def _configure_parallelism(self, mapping):
         local_fused_ep = (
@@ -574,6 +676,65 @@ class DeepseekV41ForCausalLM(shared.DeepseekV41ForCausalLM):
     model_cls = Ascend910Model
     supports_expert_placement = True
 
+    def __init__(
+        self, config, mapping, quant_config, is_multimodal_active, mm_attention_backend
+    ):
+        super().__init__(
+            config, mapping, quant_config, is_multimodal_active, mm_attention_backend
+        )
+        self.expert_placement = get_global_expert_location_metadata()
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return {
+            layer_id: layer.ffn.get_moe_routed_weights()
+            for layer_id, layer in enumerate(self.model.layers)
+        }
+
+    def _local_expert_ids(self, layer_id):
+        if self.expert_placement is not None:
+            return self.expert_placement.local_slot_logical_experts(
+                layer_id, self.mapping.moe.ep_rank
+            )
+        return super()._local_expert_ids(layer_id)
+
+    def _is_expert_auxiliary_parameter(self, name):
+        return (
+            re.fullmatch(
+                r"layers\.\d+\.ffn\.experts\.(w[12]_trans\.matrix_(left|right)|act_quantizer_w[12]\.clip_factor_a)",
+                name,
+            )
+            is not None
+        )
+
+    def _expert_loader_options(self, config):
+        return {
+            "num_experts": (
+                self.expert_placement.num_physical_experts
+                if self.expert_placement is not None
+                else config.n_routed_experts
+            ),
+            "expert_placement": self.expert_placement,
+        }
+
+    def _expert_tensor_format(self, config, n, k, field):
+        if getattr(config, "expert_dtype", None) == "bf16":
+            if field == "scale":
+                raise ValueError("BF16 experts must not have scales")
+            return (n, k), (torch.bfloat16,), 1
+        if getattr(config, "expert_dtype", None) == "int4":
+            return (
+                (n,) if field == "scale" else (n, k // 8),
+                (torch.float32,) if field == "scale" else (torch.int32,),
+                8,
+            )
+        return super()._expert_tensor_format(config, n, k, field)
+
+    def _expert_storage_tensor(self, tensor):
+        if tensor.dtype in (torch.bfloat16, torch.int32, torch.float32):
+            return tensor
+        return super()._expert_storage_tensor(tensor)
+
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
         """Prepare the selected Ascend TP policy before cache profiling or capture."""
         from tokenspeed.runtime.distributed.comm_backend.hccl_tp import (
@@ -611,8 +772,16 @@ class DeepseekV41ForCausalLM(shared.DeepseekV41ForCausalLM):
         prepare_native_tables(torch.device("npu", torch.npu.current_device()))
 
 
+class Ascend910WindowAttention(_WindowAttention):
+    @staticmethod
+    def supports_fused_rows(x):
+        return x.device.type == "npu" and x.shape[-1] == 512
+
+
 class Ascend910DSparkModel(SharedDSparkModel, Ascend910Model):
     """Keep DSpark's stage/context protocol with the target's 910 components."""
+
+    window_attention_cls = Ascend910WindowAttention
 
     def local_base_logits(self, hidden_states, head):
         if head.ndim != 2 or head.dtype != hidden_states.dtype:

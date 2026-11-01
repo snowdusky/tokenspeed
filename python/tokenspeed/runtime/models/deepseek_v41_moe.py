@@ -41,18 +41,14 @@ from tokenspeed.runtime.layers.linear import (
 )
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import (
-    ExpertLocationDispatchInfo,
     StandardTopKOutput,
     TopK,
     TopKOutput,
-    record_expert_load,
     simulated_router_logits,
-    topk_ids_logical_to_physical,
 )
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_moe_backend
 from tokenspeed.runtime.layers.quantization import Fp8Config, Mxfp4Config
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
-from tokenspeed.runtime.moe.expert_location import get_global_expert_location_metadata
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -123,11 +119,12 @@ class DeepseekV4MLP(nn.Module):
         self.tp_size = tp_size
         self.tp_group = tp_group
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.shape[0] == 0:
             return x.new_empty((0, self.down_proj.output_size))
         gate_up, _ = self.gate_up_proj(x)
-        return self.down_proj.forward_with_activation(gate_up, self.act_fn)[0]
+        out, _ = self.down_proj.forward_with_activation(gate_up, self.act_fn)
+        return out
 
 
 def _random_expert_ids(
@@ -233,21 +230,8 @@ class DeepseekV4TopK(TopK):
 
 def _deepseek_v4_routed_expert_quant_config(
     config: PretrainedConfig,
-    quant_config: QuantizationConfig | None,
-) -> tuple[QuantizationConfig | None, bool]:
-    # Offline-decoded experts retain the original FP4 values in BF16 storage;
-    # the model-wide FP8 configuration still applies to dense projections.
-    if getattr(config, "expert_dtype", None) == "bf16":
-        return None, False
-    if getattr(config, "expert_dtype", None) == "int4":
-        from tokenspeed.runtime.layers.quantization.compressed_tensors.compressed_tensors import (
-            CompressedTensorsConfig,
-        )
-
-        return (
-            CompressedTensorsConfig.from_config(config.expert_quantization_config),
-            False,
-        )
+    quant_config: QuantizationConfig,
+) -> tuple[QuantizationConfig, bool]:
     # ``quant_method=fp8`` describes the model-wide quantization, but DeepSeek
     # V4 can still serialize routed experts as packed MXFP4. Prefer the explicit
     # expert contract so packed FP4 tensors are never allocated as block FP8.
@@ -266,7 +250,8 @@ def _deepseek_v4_routed_expert_quant_config(
 
 
 class DeepseekV4MoE(nn.Module):
-    experts_cls = MoELayer
+    supports_empty_rows = False
+    routed_quant_config = staticmethod(_deepseek_v4_routed_expert_quant_config)
     shared_expert_cls = DeepseekV4MLP
 
     def _placement_enabled(self, backend):
@@ -320,19 +305,6 @@ class DeepseekV4MoE(nn.Module):
                     "DeepSeek V4 normal EP does not support redundant experts "
                     "with precomputed routing."
                 )
-        self.expert_placement = get_global_expert_location_metadata()
-        if self.expert_placement is not None:
-            # The prepared slot ABI is currently provided by the Ascend W4A4
-            # kernels. Other providers retain their existing placement limit.
-            if not placement_enabled:
-                raise ValueError("V4.1 expert placement requires ascend_v41_w4a4")
-            if self.expert_placement.num_logical_experts != config.n_routed_experts:
-                raise ValueError("V4.1 expert placement has the wrong logical geometry")
-        num_experts = (
-            self.expert_placement.num_physical_experts
-            if self.expert_placement is not None
-            else config.n_routed_experts
-        )
         if self.use_mega_moe:
             if mapping.moe.ep_size <= 1:
                 raise ValueError("DeepSeek V4 MegaMoE requires expert parallelism.")
@@ -390,18 +362,13 @@ class DeepseekV4MoE(nn.Module):
                 "--moe-mxfp4-fp8-activation selects the FlashInfer cutlass W4A8 "
                 "MoE; it does not apply to MegaMoE"
             )
-        routed_quant_config, _ = _deepseek_v4_routed_expert_quant_config(
-            config, quant_config
-        )
-        self.experts = self.experts_cls(
+        routed_quant_config, _ = self.routed_quant_config(config, quant_config)
+        self.experts = self._create_experts(
             top_k=config.num_experts_per_tok,
-            num_experts=num_experts,
+            num_experts=config.n_routed_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             quant_config=routed_quant_config,
-            internal_activation_dtype_override=(
-                "int4" if getattr(config, "expert_dtype", None) == "int4" else None
-            ),
             layer_index=layer_index,
             prefix=prefix,
             tp_rank=mapping.moe.tp_rank,
@@ -422,16 +389,6 @@ class DeepseekV4MoE(nn.Module):
                 _deepseek_v4_mega_moe_max_num_tokens() if self.use_mega_moe else None
             ),
         )
-        self.expert_dispatch = (
-            ExpertLocationDispatchInfo.init_new(
-                layer_index,
-                global_server_args_dict["ep_dispatch_algorithm"],
-                self.expert_placement,
-                all_to_all_ep=self.experts.supports_all_to_all_ep,
-            )
-            if self.expert_placement is not None
-            else None
-        )
         self.topk = DeepseekV4TopK(
             top_k=config.num_experts_per_tok,
             renormalize=self._renormalize_routing_weights(),
@@ -440,6 +397,9 @@ class DeepseekV4MoE(nn.Module):
             hash_routing=self.gate.tid2eid is not None,
             weights_dtype=self.experts.topk_weights_dtype,
         )
+
+    def _create_experts(self, **kwargs):
+        return MoELayer(**kwargs)
 
     def _owns_ep_communication(self) -> bool:
         return self.use_mega_moe or self.use_gluon_petit
@@ -492,27 +452,13 @@ class DeepseekV4MoE(nn.Module):
         router_logits, correction_bias, hash_indices_table, routing_input_ids = (
             self._routing_inputs(hidden_states, input_ids)
         )
-        output = self.topk(
+        return self.topk(
             hidden_states,
             router_logits,
             routing_correction_bias=correction_bias,
             hash_indices_table=hash_indices_table,
             input_ids=routing_input_ids,
         )
-        return self._map_topk_output(output)
-
-    def _map_topk_output(self, output: TopKOutput) -> TopKOutput:
-        if self.expert_dispatch is None:
-            return output
-        ids = topk_ids_logical_to_physical(
-            output.topk_ids, self.expert_dispatch, self.config.n_routed_experts
-        )
-        record_expert_load(self.expert_dispatch.load, ids)
-        return StandardTopKOutput(output.topk_weights, ids, output.router_logits)
-
-    def get_moe_routed_weights(self):
-        """Prepared per-slot storage; includes encoded scales read by the kernel."""
-        return self.experts.plan["expert_slot_tensors"]()
 
     def _forward_routed_experts(
         self,
@@ -589,7 +535,9 @@ class DeepseekV4MoE(nn.Module):
 
         The following all-reduce can read this memory in place.
         """
-        if hidden_states.shape[0] == 0 and not self.owns_ep_communication:
+        if hidden_states.shape[0] == 0 and not (
+            self.use_gluon_petit or self.supports_empty_rows
+        ):
             return hidden_states if out is None else out.copy_(hidden_states)
         with nvtx_range("moe_select_experts"):
             topk_output = self._compute_topk_output(hidden_states, input_ids)

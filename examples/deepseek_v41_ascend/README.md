@@ -6,8 +6,11 @@ TP1/DP8, TP2/DP4 or TP8/DP1 explicitly; all three use EP8.
 
 Model registration selects `deepseek_v41_ascend910.py` for both the target and
 DSpark on Ascend. It shares checkpoint loading and the CED/DSpark forward
-protocols with the common model. Device weight layouts, expert execution,
-Engram lookup and communication preparation live in the Ascend components.
+protocols with the common model. Device weight layouts, BF16/INT4 checkpoint rules, expert placement and load
+counters, Engram row exchange and communication preparation live in the Ascend
+components. Shared models keep their original expert and Engram interfaces;
+small construction and loading hooks let the Ascend components reuse the same
+forward and checkpoint validation paths.
 Experts use the existing kernel plans and checkpoint loaders; complete model
 warmup and decode capture prepare their collective geometry. Prefill remains
 eager in this recipe.

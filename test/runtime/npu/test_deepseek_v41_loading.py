@@ -370,6 +370,49 @@ def test_engram_gate_matches_cpu_and_captures(zero_gate):
 
 
 @torch.inference_mode()
+def test_idle_engram_reduces_peer_rows_before_returning(monkeypatch):
+    from test.runtime.test_deepseek_v41_engram import _config, _mapping, _weights
+
+    from tokenspeed.runtime.distributed import comm_ops
+    from tokenspeed.runtime.models import deepseek_v41_engram as engram
+    from tokenspeed.runtime.models.deepseek_v41_ascend910 import Ascend910Engram
+    from tokenspeed.runtime.models.deepseek_v41_parallel import EngramRowExchange
+
+    model = Ascend910Engram(
+        _config(), 1, _mapping(0, 1, 1), None, "engram", "npu", False, "gpu"
+    )
+    codes, scales = _weights(72, 32)
+    model.embed.weight_loader(model.embed.weight, codes)
+    model.embed.weight_loader(model.embed.scale, scales)
+    peer_ids = torch.arange(30, device="npu").reshape(5, 6)
+    expected = model.embed(peer_ids).flatten(-2)
+    reduced = []
+
+    def gather_rows(local, group, counts):
+        assert local.shape == (0, 6) and counts == [0, 5]
+        return peer_ids
+
+    def reduce_embeddings(values, *, group, backend, op):
+        torch.testing.assert_close(values, expected, atol=0, rtol=0)
+        reduced.append(values.clone())
+        return values + 1
+
+    monkeypatch.setattr(comm_ops, "token_all_gather_rows", gather_rows)
+    monkeypatch.setattr(engram, "all_reduce", reduce_embeddings)
+    model.row_exchange = EngramRowExchange(0, 2, 1, 0, (0, 1))
+    model.embed.tp_group = (0, 1)
+    hidden = torch.empty(0, 4, 32, device="npu", dtype=torch.bfloat16)
+    output = model(
+        hidden,
+        torch.empty(0, 6, device="npu", dtype=torch.int64),
+        torch.empty(0, device="npu", dtype=torch.bool),
+        global_num_tokens=[0, 5],
+    )
+    assert output.shape == hidden.shape
+    assert len(reduced) == 1
+
+
+@torch.inference_mode()
 def test_engram_lookup_exceeds_launch_grid_limit():
     from tokenspeed.runtime.distributed import Mapping
     from tokenspeed.runtime.models.deepseek_v41_ascend910 import (
