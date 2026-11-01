@@ -376,6 +376,11 @@ class MoELayer(torch.nn.Module):
         elif moe_backend == "mega_moe":
             mapping = global_server_args_dict["mapping"]
             process_group = pg_manager.get_device_process_group(mapping.moe.ep_group)
+        elif self._spec.a2a_backend == "ascend_mc2":
+            mapping = global_server_args_dict["mapping"]
+            process_group = pg_manager.get_dedicated_device_group(
+                mapping.moe.ep_group, "ascend_mc2"
+            )
         # --moe-combine-order: how a token's routed contributions meet across
         # the MoE TP-EP group (docs/design/numerics.md, alignment.trainer).
         # ServerArgs already refused MoE TP > 1 and DeepEP under "slot".

@@ -810,7 +810,7 @@ class DeepseekV41Engram(nn.Module):
         self.embed = self.embedding_cls(
             layout.num_embeddings[self.layer_hash_index],
             layout.head_dim,
-            self._embedding_mapping(config, mapping, device, host_table),
+            mapping,
             device,
             host_table,
             host_layout,
@@ -834,7 +834,7 @@ class DeepseekV41Engram(nn.Module):
             if not self.reduce_lane_armed:
                 logger.warning(
                     f"{prefix!s}: one-shot all-reduce lane of width {width:d} not "
-                    "armed; the Engram embedding reduce falls back to NCCL"
+                    "armed; using the backend's regular all-reduce"
                 )
 
     def checkpoint_weight_aliases(self) -> dict[str, str]:
@@ -909,9 +909,6 @@ class DeepseekV41Engram(nn.Module):
         return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(
             hidden_states.dtype
         )
-
-    def _embedding_mapping(self, config, mapping, device, host_table):
-        return mapping
 
     def _signed_magnitude(self, dot, magnitude):
         return torch.copysign(magnitude, dot)

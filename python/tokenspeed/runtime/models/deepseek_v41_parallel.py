@@ -20,13 +20,14 @@
 
 """Replicated attention rows across DP, using existing RSAG collectives."""
 
+from dataclasses import dataclass
+
 import torch
 
 
-def supports_ascend_dp_moe(mapping, backend, is_npu):
+def supports_ascend_dp_moe(mapping, backend):
     return (
-        is_npu
-        and backend in ("ascend_v41_mxfp4", "ascend_v41_bf16", "ascend_v41_w4a4")
+        backend in ("ascend_v41_mxfp4", "ascend_v41_bf16", "ascend_v41_w4a4")
         and mapping.attn.dp_size > 1
         and mapping.dense.tp_size == mapping.attn.tp_size
         and mapping.attn.tp_size <= 8
@@ -128,9 +129,6 @@ def replicated_rows_moe(x, image_mask, ctx, ffn, comm_manager):
     return comm_manager.gather_scattered_rows(scattered, ctx)
 
 
-from dataclasses import dataclass
-
-
 @dataclass(frozen=True)
 class EngramRowExchange:
     rank: int
@@ -166,12 +164,11 @@ def validate_replica_counts_for_engram(table, rank, world, tp, local_rows):
     return counts
 
 
-def resolve_engram_table_mapping(mapping, requested, *, device_type, host_table):
+def resolve_engram_table_mapping(mapping, requested, *, host_table):
     if requested is None or requested == mapping.attn.tp_size:
         return mapping, None
     if (
         requested != mapping.world_size
-        or device_type != "npu"
         or host_table
         or mapping.pp_size != 1
         or not mapping.attn.has_dp

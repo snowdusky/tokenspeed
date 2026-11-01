@@ -251,7 +251,6 @@ def _deepseek_v4_routed_expert_quant_config(
 
 class DeepseekV4MoE(nn.Module):
     supports_empty_rows = False
-    routed_quant_config = staticmethod(_deepseek_v4_routed_expert_quant_config)
     shared_expert_cls = DeepseekV4MLP
 
     def _placement_enabled(self, backend):
@@ -362,13 +361,11 @@ class DeepseekV4MoE(nn.Module):
                 "--moe-mxfp4-fp8-activation selects the FlashInfer cutlass W4A8 "
                 "MoE; it does not apply to MegaMoE"
             )
-        routed_quant_config, _ = self.routed_quant_config(config, quant_config)
-        self.experts = self._create_experts(
+        self.experts = MoELayer(
+            **self._routed_expert_options(config, quant_config),
             top_k=config.num_experts_per_tok,
-            num_experts=config.n_routed_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
-            quant_config=routed_quant_config,
             layer_index=layer_index,
             prefix=prefix,
             tp_rank=mapping.moe.tp_rank,
@@ -398,8 +395,14 @@ class DeepseekV4MoE(nn.Module):
             weights_dtype=self.experts.topk_weights_dtype,
         )
 
-    def _create_experts(self, **kwargs):
-        return MoELayer(**kwargs)
+    def _routed_expert_options(self, config, quant_config):
+        routed_quant_config, _ = _deepseek_v4_routed_expert_quant_config(
+            config, quant_config
+        )
+        return {
+            "num_experts": config.n_routed_experts,
+            "quant_config": routed_quant_config,
+        }
 
     def _owns_ep_communication(self) -> bool:
         return self.use_mega_moe or self.use_gluon_petit

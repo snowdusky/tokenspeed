@@ -109,10 +109,6 @@ def _write_window_rows(
 class _WindowAttention:
     """Borrow one stage's LCM window pages for one forward; no state survives."""
 
-    @staticmethod
-    def supports_fused_rows(x):
-        return x.is_cuda and x.shape[-1] == 512
-
     def __init__(
         self, positions, window, history_slots, block_size, selection, request_indices
     ):
@@ -135,7 +131,7 @@ class _WindowAttention:
         the target writes its own SWA rows.
         """
         batch, block = self.history_slots.shape[0], self.block_size
-        if self.supports_fused_rows(swa):
+        if dsv41.dspark_rows_supported(swa):
             return dsv41.dspark_workspace(
                 swa,
                 swa_norm_weight,
@@ -179,7 +175,7 @@ class _WindowAttention:
         kv = self._workspace(
             swa, positions, swa_rope_cache, swa_norm_weight, swa_norm_eps
         )
-        if self.supports_fused_rows(q):
+        if dsv41.dspark_rows_supported(q):
             out = self._kernel_forward(q, kv, attn_sink, softmax_scale)
         else:
             out = self._reference_forward(q, kv, attn_sink, softmax_scale)
@@ -228,8 +224,6 @@ class _WindowAttention:
 
 
 class DeepseekV41DSparkModel(DeepseekV41Model):
-    window_attention_cls = _WindowAttention
-
     def local_base_logits(
         self,
         hidden_states: torch.Tensor,
@@ -381,7 +375,7 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
         for stage, layer in enumerate(self.layers):
             window = cache_pool.dspark_kv(stage)
             stage_kv = kv[:, stage * head_dim : (stage + 1) * head_dim]
-            if self.window_attention_cls.supports_fused_rows(stage_kv):
+            if dsv41.dspark_rows_supported(stage_kv):
                 layer.attn.rotary_emb._prepare_cache(kv.device)
                 dsv41.dspark_rows(
                     stage_kv,
@@ -426,7 +420,7 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
         h = h[:, None, :].repeat(1, self.config.hc_mult, 1)
         pending_post = None
         for stage, layer in enumerate(self.layers):
-            backend = self.window_attention_cls(
+            backend = _WindowAttention(
                 positions,
                 cache_pool.dspark_kv(stage),
                 history_slots,

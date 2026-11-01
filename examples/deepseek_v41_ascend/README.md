@@ -6,14 +6,19 @@ TP1/DP8, TP2/DP4 or TP8/DP1 explicitly; all three use EP8.
 
 Model registration selects `deepseek_v41_ascend910.py` for both the target and
 DSpark on Ascend. It shares checkpoint loading and the CED/DSpark forward
-protocols with the common model. Device weight layouts, BF16/INT4 checkpoint rules, expert placement and load
-counters, Engram row exchange and communication preparation live in the Ascend
-components. Shared models keep their original expert and Engram interfaces;
-small construction and loading hooks let the Ascend components reuse the same
-forward and checkpoint validation paths.
-Experts use the existing kernel plans and checkpoint loaders; complete model
-warmup and decode capture prepare their collective geometry. Prefill remains
-eager in this recipe.
+protocols with the common model. Device weight layouts, BF16/INT4 checkpoint
+rules, expert placement and load counters, Engram row exchange and communication
+preparation live in the Ascend components. Routed experts use the same
+`MoELayer` as other models: the model provides its configuration, the kernel
+registry selects weight preparation and execution, and the common MoE layer
+binds MC2's dedicated communicator before weight processing. Complete model
+warmup and decode capture prepare collective geometry. Prefill remains eager
+in this recipe.
+
+DSpark uses one window implementation across platforms and queries the kernel
+family for fused-row support. Engram resolves its table mapping at construction
+and reuses the common gate calculation. Shared attention and hyperconnection
+branches use the device-neutral stream utility.
 
 The TP8 recipe explicitly selects FP32 accumulation for BF16 reductions and
 AIV transport for reductions and gathers up to 2 MiB. The same policy supports
@@ -69,7 +74,8 @@ integer operations instead of requiring native FP8 tensor conversion on 910.
 V4.1 FlatQuant W4A4 supports the standard expert placement and online EPLB
 controller. MC2 selects a local-row load mask so idle and padded rows do not
 inflate expert counts; other transports keep their existing recorder layout.
-The model binds MC2's dedicated communicator before expert weight processing.
+The common MoE layer binds MC2's dedicated communicator before expert weight
+processing.
 MC2 dispatches the full rank-consistent row capacity once per layer, including
 idle ranks, and combines once after GMM. Size `HCCL_BUFFSIZE` for the largest
 prefill or graph-capture capacity and the physical expert count, including

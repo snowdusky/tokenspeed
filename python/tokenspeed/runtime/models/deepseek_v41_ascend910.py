@@ -35,32 +35,26 @@ from copy import copy
 import torch
 from tokenspeed_kernel.ops.activation.dsv41 import shared_expert_swiglu
 from tokenspeed_kernel.ops.attention import dsv41
-from tokenspeed_kernel.ops.moe import moe_apply, moe_plan, moe_process_weights
 from tokenspeed_kernel.ops.quantization import dequantize_mxfp_weight
 from torch import nn
 
-from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.layers.activation import SwigluArg
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.moe.topk import (
     ExpertLocationDispatchInfo,
     StandardTopKOutput,
-    TopKOutputFormat,
     record_expert_load,
     topk_ids_logical_to_physical,
 )
-from tokenspeed.runtime.layers.moe.types import MoELayerSpec
 from tokenspeed.runtime.layers.moe.utils import (
     All2AllBackend,
     get_all2all_backend,
     get_moe_backend,
 )
-from tokenspeed.runtime.layers.moe.weights import create_layer_weights
 from tokenspeed.runtime.layers.parameter import ModelWeightParameter
 from tokenspeed.runtime.layers.quantization.utils import (
     should_exclude_quant_module,
@@ -73,22 +67,16 @@ from tokenspeed.runtime.models.deepseek_v41_dspark import (
 from tokenspeed.runtime.models.deepseek_v41_dspark import (
     DeepseekV41ForCausalLMDSpark as SharedDSparkForCausalLM,
 )
-from tokenspeed.runtime.models.deepseek_v41_dspark import (
-    _WindowAttention,
-)
 from tokenspeed.runtime.models.deepseek_v41_engram import RowShardedEngramEmbedding
-from tokenspeed.runtime.models.deepseek_v41_moe import (
-    DeepseekV4MLP,
-    _deepseek_v4_routed_expert_quant_config,
-)
+from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MLP
 from tokenspeed.runtime.models.deepseek_v41_parallel import (
     create_decoder_cpu_group,
     decoder_global_rows,
     replicated_rows_moe,
+    resolve_engram_table_mapping,
     supports_ascend_dp_moe,
 )
 from tokenspeed.runtime.moe.expert_location import get_global_expert_location_metadata
-from tokenspeed.runtime.utils.device_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
@@ -239,7 +227,6 @@ class Ascend910Compressor(shared.DeepseekV41Compressor):
 
 
 class Ascend910Attention(shared.DeepseekV41Attention):
-    stream_fork_cls = StreamFork
     compressor_cls = Ascend910Compressor
 
     def _configure_output_geometry(self, config, mapping):
@@ -283,195 +270,10 @@ class Ascend910Attention(shared.DeepseekV41Attention):
 def _replicate_moe_rows(mapping):
     if get_all2all_backend() is All2AllBackend.ASCEND_MC2:
         return False
-    enabled = supports_ascend_dp_moe(mapping, get_moe_backend().value, True)
+    enabled = supports_ascend_dp_moe(mapping, get_moe_backend().value)
     if enabled and global_server_args_dict["moe_combine_order"] != "rank":
         raise ValueError("Ascend V4.1 DP MoE requires --moe-combine-order rank")
     return enabled
-
-
-class Ascend910Experts(nn.Module):
-    """910 experts with model-owned preparation and ordinary checkpoint loaders.
-
-    The module owns its plan and weights; there is no nested MoELayer. MC2 is
-    warmed by the complete model forward with real distributed row geometry.
-    """
-
-    def __init__(
-        self,
-        *,
-        top_k,
-        num_experts,
-        hidden_size,
-        intermediate_size,
-        quant_config,
-        internal_activation_dtype_override,
-        layer_index,
-        prefix,
-        tp_rank,
-        tp_size,
-        ep_rank,
-        ep_size,
-        activation,
-        swiglu_limit,
-        with_bias,
-        routing_mode,
-        routing_config,
-        persistent_max_num_tokens_per_gpu,
-    ):
-        super().__init__()
-        if activation != "swiglu" or with_bias or routing_mode != "precomputed_topk":
-            raise ValueError(
-                "V4.1 910 experts require bias-free SwiGLU with precomputed routing"
-            )
-        if tp_size > 1 and ep_size > 1 or num_experts % ep_size:
-            raise ValueError(
-                "V4.1 910 experts require unmixed TP/EP and equal expert shards"
-            )
-        if global_server_args_dict["moe_mxfp4_fp8_activation"]:
-            raise ValueError("V4.1 910 experts do not implement FP8 activations")
-        self.layer_index, self.prefix = layer_index, prefix
-        self.top_k, self.num_experts = top_k, num_experts
-        self.hidden_size, self.intermediate_size = hidden_size, intermediate_size
-        self.tp_rank, self.tp_size, self.moe_tp_size = tp_rank, tp_size, tp_size
-        self.ep_rank, self.ep_size = ep_rank, ep_size
-        self.num_local_experts = num_experts // ep_size
-        self.activation = activation
-        self.swiglu_arg = SwigluArg(alpha=None, limit=swiglu_limit)
-        self.swiglu_beta = None
-        self.w13_input_layout = "concatenated"
-        self.routing_config = routing_config
-        self.input_dtype = torch.get_default_dtype()
-        if self.input_dtype != torch.bfloat16:
-            raise ValueError("V4.1 910 experts require BF16 input")
-        self.quant_config = quant_config
-        self._quant_kind = "unquant"
-        if quant_config is not None and not (
-            should_ignore_quant_layer(prefix, quant_config.ignored_layers)
-            or should_exclude_quant_module(
-                f"{prefix}.experts", quant_config.exclude_modules
-            )
-        ):
-            self.quant_config = quant_config.get_moe_quant_config(prefix)
-            self._quant_kind = self.quant_config.moe_weight_dtype(prefix)
-        if self._quant_kind not in {"unquant", "mxfp4", "int4", "int8"}:
-            raise ValueError(f"Unsupported V4.1 910 expert format: {self._quant_kind}")
-        a2a = get_all2all_backend().value
-        if a2a not in {"none", "ascend_mc2"}:
-            raise ValueError(f"Unsupported V4.1 910 expert transport: {a2a}")
-        self.combine_order = global_server_args_dict["moe_combine_order"]
-        if self.combine_order != "rank":
-            raise ValueError("V4.1 910 experts require rank combine")
-        self._spec = MoELayerSpec(
-            top_k=top_k,
-            num_experts=num_experts,
-            num_local_experts=self.num_local_experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            activation=activation,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            ep_rank=ep_rank,
-            ep_size=ep_size,
-            prefix=prefix,
-            a2a_backend=a2a,
-        )
-        process_group = None
-        if a2a == "ascend_mc2":
-            process_group = pg_manager.get_dedicated_device_group(
-                global_server_args_dict["mapping"].moe.ep_group, "ascend_mc2"
-            )
-        internal_activation_dtype = "input"
-        if self._quant_kind == "mxfp4":
-            if self.quant_config.is_w4a8_fp8:
-                internal_activation_dtype = "fp8"
-            elif self.quant_config.use_dynamic_mxfp4_activations:
-                internal_activation_dtype = "mxfp4"
-        if internal_activation_dtype_override is not None:
-            internal_activation_dtype = internal_activation_dtype_override
-        backend = get_moe_backend().value
-        bitwise = global_server_args_dict["numerics"] in BITWISE_ENVELOPES
-        self.plan = moe_plan(
-            self._quant_kind,
-            input_dtype=self.input_dtype,
-            activation=activation,
-            routing_mode=routing_mode,
-            a2a_backend=a2a,
-            ep_size=ep_size,
-            ispp=intermediate_size // tp_size,
-            hidden=hidden_size,
-            num_experts=num_experts,
-            top_k=top_k,
-            swiglu_form="standard",
-            activation_clamped=swiglu_limit is not None,
-            expert_id_repeats=False,
-            internal_activation_dtype=internal_activation_dtype,
-            with_bias=False,
-            process_group=process_group,
-            persistent_max_num_tokens_per_gpu=persistent_max_num_tokens_per_gpu,
-            features=frozenset({"batch_invariant"}) if bitwise else frozenset(),
-            solution=None if backend == "auto" else backend,
-            fast_math=not bitwise,
-            combine_order=self.combine_order,
-        )
-        create_layer_weights(
-            self._spec,
-            self,
-            self._quant_kind,
-            self.quant_config,
-            with_bias=False,
-            solution=self.plan["solution"],
-        )
-        self._weights_processed = False
-        self._moe_backend_state: object | None = None
-
-    def process_weights_after_loading(self, module):
-        if self._weights_processed:
-            return
-        moe_process_weights(self.plan, module)
-        self._weights_processed = True
-
-    @property
-    def topk_weights_dtype(self):
-        return self.plan["topk_weights_dtype"]
-
-    @property
-    def topk_output_format(self):
-        return TopKOutputFormat.STANDARD
-
-    @property
-    def supports_precomputed_topk(self):
-        return self.plan["supports_precomputed_topk"]
-
-    @property
-    def supports_all_to_all_ep(self):
-        return self.plan["supports_all_to_all_ep"]
-
-    @property
-    def supports_deferred_cuda_finalize(self):
-        return False
-
-    def forward(
-        self,
-        hidden_states,
-        topk_output,
-        num_global_tokens,
-        max_num_tokens_per_gpu,
-        *,
-        do_finalize,
-    ):
-        if not do_finalize or topk_output.format.is_bypassed():
-            raise ValueError("V4.1 910 experts require finalized precomputed routes")
-        return moe_apply(
-            self.plan,
-            hidden_states,
-            self,
-            topk_output.router_logits,
-            topk_weights=topk_output.topk_weights,
-            topk_ids=topk_output.topk_ids,
-            num_tokens_global=num_global_tokens,
-            max_num_tokens_per_gpu=max_num_tokens_per_gpu,
-            do_finalize=True,
-        )
 
 
 class Ascend910MoE(shared.DeepseekV41MoE):
@@ -479,6 +281,8 @@ class Ascend910MoE(shared.DeepseekV41MoE):
     supports_empty_rows = True
 
     def __init__(self, config, mapping, quant_config, layer_index, prefix, aux_stream):
+        if global_server_args_dict["moe_mxfp4_fp8_activation"]:
+            raise ValueError("V4.1 910 experts do not implement FP8 activations")
         self.expert_placement = get_global_expert_location_metadata()
         self.expert_dispatch = None
         if self.expert_placement is not None:
@@ -495,28 +299,29 @@ class Ascend910MoE(shared.DeepseekV41MoE):
                 all_to_all_ep=self.experts.supports_all_to_all_ep,
             )
 
-    @staticmethod
-    def routed_quant_config(config, quant_config):
-        if getattr(config, "expert_dtype", None) == "bf16":
-            return None, False
-        if getattr(config, "expert_dtype", None) == "int4":
+    def _routed_expert_options(self, config, quant_config):
+        expert_dtype = getattr(config, "expert_dtype", None)
+        if expert_dtype == "bf16":
+            options = {"num_experts": config.n_routed_experts, "quant_config": None}
+        elif expert_dtype == "int4":
             from tokenspeed.runtime.layers.quantization.compressed_tensors.compressed_tensors import (
                 CompressedTensorsConfig,
             )
 
-            return (
-                CompressedTensorsConfig.from_config(config.expert_quantization_config),
-                False,
-            )
-        return _deepseek_v4_routed_expert_quant_config(config, quant_config)
-
-    def _create_experts(self, **kwargs):
+            options = {
+                "num_experts": config.n_routed_experts,
+                "quant_config": CompressedTensorsConfig.from_config(
+                    config.expert_quantization_config
+                ),
+            }
+        else:
+            options = super()._routed_expert_options(config, quant_config)
         if self.expert_placement is not None:
-            kwargs["num_experts"] = self.expert_placement.num_physical_experts
-        kwargs["internal_activation_dtype_override"] = (
-            "int4" if getattr(self.config, "expert_dtype", None) == "int4" else None
+            options["num_experts"] = self.expert_placement.num_physical_experts
+        options["internal_activation_dtype_override"] = (
+            "int4" if expert_dtype == "int4" else None
         )
-        return Ascend910Experts(**kwargs)
+        return options
 
     def _compute_topk_output(self, hidden_states, input_ids):
         output = super()._compute_topk_output(hidden_states, input_ids)
@@ -573,26 +378,34 @@ class Ascend910EngramEmbedding(RowShardedEngramEmbedding):
 class Ascend910Engram(shared.DeepseekV41Engram):
     embedding_cls = Ascend910EngramEmbedding
 
-    def __init__(self, *args, **kwargs):
-        self.row_exchange = None
-        super().__init__(*args, **kwargs)
-
-    def _embedding_mapping(self, config, mapping, device, host_table):
-        from tokenspeed.runtime.models.deepseek_v41_parallel import (
-            resolve_engram_table_mapping,
-        )
-
+    def __init__(
+        self,
+        config,
+        layer_id,
+        mapping,
+        quant_config,
+        prefix,
+        device,
+        host_table,
+        host_layout,
+    ):
         tables, self.row_exchange = resolve_engram_table_mapping(
-            mapping,
-            global_server_args_dict["engram_tp_size"],
-            device_type="npu",
-            host_table=host_table,
+            mapping, global_server_args_dict["engram_tp_size"], host_table=host_table
         )
         if self.row_exchange is not None and any(
             i >= config.candidate_source_layer_id for i in config.engram_layer_ids
         ):
             raise ValueError("Shared Engram table rows must precede CED narrowing")
-        return tables
+        super().__init__(
+            config,
+            layer_id,
+            tables,
+            quant_config,
+            prefix,
+            device,
+            host_table,
+            host_layout,
+        )
 
     def forward(self, hidden_states, hash_ids, token_mask, *, global_num_tokens):
         self._check_input_shapes(hidden_states, hash_ids, token_mask)
@@ -618,7 +431,6 @@ class Ascend910DecoderLayer(shared.DeepseekV41DecoderLayer):
     attention_cls = Ascend910Attention
     moe_cls = Ascend910MoE
     engram_cls = Ascend910Engram
-    stream_fork_cls = StreamFork
     dense_quant_config = staticmethod(dense_quant_config)
 
     def _expert_aux_stream(self, aux_stream):
@@ -730,11 +542,6 @@ class DeepseekV41ForCausalLM(shared.DeepseekV41ForCausalLM):
             )
         return super()._expert_tensor_format(config, n, k, field)
 
-    def _expert_storage_tensor(self, tensor):
-        if tensor.dtype in (torch.bfloat16, torch.int32, torch.float32):
-            return tensor
-        return super()._expert_storage_tensor(tensor)
-
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
         """Prepare the selected Ascend TP policy before cache profiling or capture."""
         from tokenspeed.runtime.distributed.comm_backend.hccl_tp import (
@@ -761,8 +568,6 @@ class DeepseekV41ForCausalLM(shared.DeepseekV41ForCausalLM):
                 weight = module.wo_a.weight
                 if weight.is_contiguous():
                     weight.data = weight.T.contiguous().T
-            elif isinstance(module, Ascend910Experts):
-                module.process_weights_after_loading(module)
 
     def post_quant_warmup(self):
         super().post_quant_warmup()
@@ -772,16 +577,8 @@ class DeepseekV41ForCausalLM(shared.DeepseekV41ForCausalLM):
         prepare_native_tables(torch.device("npu", torch.npu.current_device()))
 
 
-class Ascend910WindowAttention(_WindowAttention):
-    @staticmethod
-    def supports_fused_rows(x):
-        return x.device.type == "npu" and x.shape[-1] == 512
-
-
 class Ascend910DSparkModel(SharedDSparkModel, Ascend910Model):
     """Keep DSpark's stage/context protocol with the target's 910 components."""
-
-    window_attention_cls = Ascend910WindowAttention
 
     def local_base_logits(self, hidden_states, head):
         if head.ndim != 2 or head.dtype != hidden_states.dtype:

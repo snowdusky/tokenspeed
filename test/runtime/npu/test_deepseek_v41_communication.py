@@ -51,6 +51,64 @@ def mapping():
     dist.destroy_process_group()
 
 
+@pytest.mark.parametrize("idle_rank", [False, True])
+@torch.no_grad()
+def test_engram_world_table_matches_local_reference(mapping, monkeypatch, idle_rank):
+    from test.runtime.test_deepseek_v41_engram import _config, _mapping, _weights
+
+    from tokenspeed.runtime.distributed.comm_backend import (
+        get_global_backend,
+        set_global_backend,
+    )
+    from tokenspeed.runtime.models.deepseek_v41_ascend910 import Ascend910Engram
+    from tokenspeed.runtime.models.deepseek_v41_engram import DeepseekV41Engram
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    world, rank = mapping.world_size, mapping.rank
+    layout = Mapping(
+        rank=rank,
+        world_size=world,
+        attn_tp_size=1,
+        attn_dp_size=world,
+        dense_tp_size=1,
+        moe_tp_size=1,
+        moe_ep_size=world,
+    )
+    monkeypatch.setitem(global_server_args_dict, "mapping", layout)
+    monkeypatch.setitem(global_server_args_dict, "engram_tp_size", world)
+    config = _config()
+    config.candidate_source_layer_id = 20
+    previous_backend = get_global_backend()
+    set_global_backend(HcclBackend())
+    try:
+        model = Ascend910Engram(config, 1, layout, None, "engram", "npu", False, "gpu")
+        reference = DeepseekV41Engram(
+            config, 1, _mapping(0, 1, 1), None, "engram", "cpu", False, "gpu"
+        )
+        codes, scales = _weights(72, 32)
+        for owner in (model, reference):
+            owner.embed.weight_loader(owner.embed.weight, codes)
+            owner.embed.weight_loader(owner.embed.scale, scales)
+        torch.manual_seed(125)
+        reference.wkv.weight.normal_(std=0.03)
+        model.wkv.weight.copy_(reference.wkv.weight)
+        model.wkv.quant_method.process_weights_after_loading(model.wkv)
+        counts = [0 if idle_rank and i == 0 else i + 2 for i in range(world)]
+        rows = counts[rank]
+        ids = (torch.arange(rows * 6).reshape(rows, 6) + rank * 7) % 72
+        hidden = torch.randn(rows, 4, 32, dtype=torch.bfloat16)
+        mask = torch.arange(rows) % 2 == 0
+        expected = reference(hidden, ids, mask)
+        actual = model(
+            hidden.to("npu"), ids.to("npu"), mask.to("npu"), global_num_tokens=counts
+        )
+        torch.testing.assert_close(
+            actual.cpu(), expected, atol=0.0078125, rtol=0.0078125
+        )
+    finally:
+        set_global_backend(previous_backend)
+
+
 @pytest.mark.parametrize("rows", [1, 32])
 def test_hccl_collectives_and_async_work(mapping, rows):
     group = mapping.attn.tp_group

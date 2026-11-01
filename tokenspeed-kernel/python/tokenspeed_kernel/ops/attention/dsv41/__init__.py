@@ -72,6 +72,7 @@ __all__ = [
     "dspark_anchors",
     "dspark_block",
     "dspark_rows",
+    "dspark_rows_supported",
     "global_rope_scatter",
     "global_slots",
     "index_candidates",
@@ -910,6 +911,22 @@ def rope_pad_query(
         solution=solution,
     )
     return kernel(values, positions, cos_sin_cache)
+
+
+def dspark_rows_supported(values: torch.Tensor) -> bool:
+    """Whether BF16 [...,512] rows can use the registered DSpark device kernels."""
+    if (
+        values.device.type in ("cpu", "meta")
+        or values.ndim not in (2, 3)
+        or values.dtype != torch.bfloat16
+        or values.shape[-1] != 512
+    ):
+        return False
+    try:
+        _kernel("dspark_rows", values)
+    except NoKernelFoundError:
+        return False
+    return True
 
 
 def dspark_rows(

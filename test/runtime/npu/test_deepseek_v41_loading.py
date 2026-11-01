@@ -131,16 +131,21 @@ def test_fp8_row_shard_crossing_scale_block(tp_size, tp_rank):
     )
 
 
-@pytest.mark.parametrize("model_owned", [False, True])
 @pytest.mark.parametrize("rows", [1, 8, 32])
-@pytest.mark.parametrize("backend", ["ascend_v41_bf16", "ascend_v41_mxfp4"])
+@pytest.mark.parametrize(
+    "backend,checkpoint_dtype",
+    [
+        ("ascend_v41_bf16", "mxfp4"),
+        ("ascend_v41_mxfp4", "mxfp4"),
+        ("ascend_v41_bf16", "bf16"),
+    ],
+)
 @pytest.mark.parametrize("ep_size", [1, 2])
-def test_mxfp4_moe_load_and_acl_replay(rows, backend, ep_size, model_owned):
+def test_routed_experts_load_and_acl_replay(rows, backend, ep_size, checkpoint_dtype):
     from tokenspeed.runtime.layers.moe import utils
     from tokenspeed.runtime.layers.moe.expert import MoELayer
     from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput
     from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
-    from tokenspeed.runtime.models.deepseek_v41_ascend910 import Ascend910Experts
     from tokenspeed.runtime.moe.expert_location_updater import _all_to_all_ep
 
     previous = utils.MOE_BACKEND
@@ -151,48 +156,87 @@ def test_mxfp4_moe_load_and_acl_replay(rows, backend, ep_size, model_owned):
                 previous_dtype = torch.get_default_dtype()
                 torch.set_default_dtype(torch.bfloat16)
                 try:
-                    layer = (Ascend910Experts if model_owned else MoELayer)(
-                        top_k=2,
-                        num_experts=4,
-                        hidden_size=256,
-                        intermediate_size=128,
-                        quant_config=Mxfp4Config(is_checkpoint_mxfp4_serialized=True),
-                        layer_index=0,
-                        prefix="test",
-                        tp_rank=0,
-                        tp_size=1,
-                        ep_rank=ep_size - 1,
-                        ep_size=ep_size,
-                        activation="swiglu",
-                        swiglu_limit=7.0,
-                        routing_mode="precomputed_topk",
-                        routing_config={},
-                        internal_activation_dtype_override=None,
-                        persistent_max_num_tokens_per_gpu=None,
-                        with_bias=False,
-                    )
+                    if checkpoint_dtype == "bf16":
+                        from test.runtime.test_deepseek_v41_engram import _mapping
+
+                        from transformers import PretrainedConfig
+
+                        from tokenspeed.runtime.models.deepseek_v41_ascend910 import (
+                            Ascend910MoE,
+                        )
+
+                        config = PretrainedConfig(
+                            n_routed_experts=4,
+                            num_experts_per_tok=2,
+                            hidden_size=256,
+                            moe_intermediate_size=128,
+                            n_shared_experts=None,
+                            hidden_act="silu",
+                            swiglu_limit=7.0,
+                            num_hash_layers=0,
+                            vocab_size=32,
+                            norm_topk_prob=True,
+                            expert_dtype="bf16",
+                        )
+                        block = Ascend910MoE(
+                            config,
+                            _mapping(ep_size - 1, ep_size, ep_size),
+                            None,
+                            0,
+                            "test",
+                            None,
+                        )
+                        layer = block.experts
+                    else:
+                        layer = MoELayer(
+                            top_k=2,
+                            num_experts=4,
+                            hidden_size=256,
+                            intermediate_size=128,
+                            quant_config=Mxfp4Config(
+                                is_checkpoint_mxfp4_serialized=True
+                            ),
+                            layer_index=0,
+                            prefix="test",
+                            tp_rank=0,
+                            tp_size=1,
+                            ep_rank=ep_size - 1,
+                            ep_size=ep_size,
+                            activation="swiglu",
+                            swiglu_limit=7.0,
+                            routing_mode="precomputed_topk",
+                            routing_config={},
+                            internal_activation_dtype_override=None,
+                            persistent_max_num_tokens_per_gpu=None,
+                            with_bias=False,
+                        )
                     assert not _all_to_all_ep(torch.nn.Sequential(layer))
                 finally:
                     torch.set_default_dtype(previous_dtype)
     finally:
         utils.MOE_BACKEND = previous
     torch.manual_seed(42)
-    for p in (layer.w13_weight, layer.w2_weight):
-        p.data.copy_(torch.randint(0, 256, p.shape, dtype=torch.uint8))
-    for p in (layer.w13_weight_scale, layer.w2_weight_scale):
-        p.data.fill_(122)
-    from tokenspeed_kernel_npu.ops.mxfp import dequantize_mxfp_weight
+    if checkpoint_dtype == "bf16":
+        for p in (layer.w13_weight, layer.w2_weight):
+            p.data.normal_(std=0.05)
+        references = [layer.w13_weight.clone(), layer.w2_weight.clone()]
+    else:
+        for p in (layer.w13_weight, layer.w2_weight):
+            p.data.copy_(torch.randint(0, 256, p.shape, dtype=torch.uint8))
+        for p in (layer.w13_weight_scale, layer.w2_weight_scale):
+            p.data.fill_(122)
+        from tokenspeed_kernel_npu.ops.mxfp import dequantize_mxfp_weight
 
-    references = []
-    for weight, scale in (
-        (layer.w13_weight, layer.w13_weight_scale),
-        (layer.w2_weight, layer.w2_weight_scale),
-    ):
-        references.append(
-            dequantize_mxfp_weight(
-                weight.flatten(0, 1), scale.flatten(0, 1), 4, (1, 32)
-            ).reshape(weight.shape[0], weight.shape[1], weight.shape[2] * 2)
-        )
+        references = []
+        for weight, scale in (
+            (layer.w13_weight, layer.w13_weight_scale),
+            (layer.w2_weight, layer.w2_weight_scale),
+        ):
+            references.append(
+                dequantize_mxfp_weight(
+                    weight.flatten(0, 1), scale.flatten(0, 1), 4, (1, 32)
+                ).reshape(weight.shape[0], weight.shape[1], weight.shape[2] * 2)
+            )
     w13_reference, w2_reference = references
     layer.process_weights_after_loading(layer)
     if backend == "ascend_v41_mxfp4":
@@ -440,6 +484,57 @@ def test_engram_lookup_exceeds_launch_grid_limit():
     )
     actual = model(ids.to("npu"))
     torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)
+
+
+@torch.inference_mode()
+def test_shared_dspark_window_matches_cpu_and_captures():
+    from test.runtime.test_deepseek_v41_dspark import _window_backend
+
+    from tokenspeed_kernel.plugins import discover_plugins
+
+    discover_plugins()
+    torch.manual_seed(93)
+    positions = torch.arange(6, device="npu")
+    history = torch.tensor([[64, 65, -1, -1], [66, 67, 68, -1]], device="npu")
+    window = torch.randn(3, 64, 512, dtype=torch.bfloat16, device="npu")
+    backend = _window_backend(positions, window, history, 3, 64)
+    reference = _window_backend(positions.cpu(), window.cpu(), history.cpu(), 3, 64)
+    query = torch.randn(6, 2, 512, dtype=torch.bfloat16, device="npu")
+    swa = torch.randn(6, 512, dtype=torch.bfloat16, device="npu")
+    sink = torch.randn(2, device="npu")
+
+    def forward(owner, q, kv, bias):
+        return owner.forward_v41(
+            q,
+            kv,
+            layer_id=0,
+            positions=owner.meta.positions,
+            request_indices=owner.meta.request_indices,
+            forward_mode=None,
+            index_q=None,
+            index_weights=None,
+            attn_sink=bias,
+            softmax_scale=512**-0.5,
+            index_process_group=None,
+            swa_rope_cache=None,
+            swa_norm_weight=None,
+            swa_norm_eps=None,
+        )
+
+    for _ in range(3):
+        forward(backend, query, swa, sink)
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph, auto_dispatch_capture=True):
+        output = forward(backend, query, swa, sink)
+    for _ in range(2):
+        query.normal_()
+        swa.normal_()
+        expected = forward(reference, query.cpu(), swa.cpu(), sink.cpu())
+        eager = forward(backend, query, swa, sink)
+        torch.testing.assert_close(eager.cpu(), expected, atol=0.015625, rtol=0.0078125)
+        graph.replay()
+        torch.npu.synchronize()
+        torch.testing.assert_close(output, eager, atol=0, rtol=0)
 
 
 @torch.inference_mode()

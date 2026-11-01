@@ -177,7 +177,7 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalInputs,
 )
 from tokenspeed.runtime.utils import add_prefix
-from tokenspeed.runtime.utils.cuda_stream import StreamFork
+from tokenspeed.runtime.utils.device_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = logging.getLogger(__name__)
@@ -871,7 +871,6 @@ def _row_plan(layer_id: int, ced_decoder_start: int, ctx: ForwardContext) -> V41
 
 
 class DeepseekV41Attention(nn.Module):
-    stream_fork_cls = StreamFork
     compressor_cls = DeepseekV41Compressor
 
     def __init__(
@@ -886,7 +885,7 @@ class DeepseekV41Attention(nn.Module):
         aux_stream: torch.cuda.Stream | None,
     ):
         super().__init__()
-        self.stream_fork = self.stream_fork_cls(aux_stream)
+        self.stream_fork = StreamFork(aux_stream)
         self.layer_id = layer_id
         self.ced_decoder_start = ced_decoder_start
         self.mapping = mapping
@@ -1480,7 +1479,6 @@ class DeepseekV41DecoderLayer(nn.Module):
     attention_cls = DeepseekV41Attention
     moe_cls = DeepseekV41MoE
     engram_cls = DeepseekV41Engram
-    stream_fork_cls = StreamFork
     dense_quant_config = staticmethod(v41_mxfp8_config)
 
     def _expert_aux_stream(self, aux_stream):
@@ -1504,7 +1502,7 @@ class DeepseekV41DecoderLayer(nn.Module):
         self.ced_decoder_start = ced_decoder_start
         self.norm_eps, self.hc_eps = config.rms_norm_eps, config.hc_eps
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
-        self.hc_stream_fork = self.stream_fork_cls(hc_stream)
+        self.hc_stream_fork = StreamFork(hc_stream)
         dense_quant = self.dense_quant_config(quant_config)
         self.attn = self.attention_cls(
             config,
@@ -2656,9 +2654,6 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         )
         return (n, k // packing), allowed, packing
 
-    def _expert_storage_tensor(self, tensor):
-        return tensor.view(torch.uint8)
-
     def _checkpoint_targets(self) -> dict[str, tuple[str, int | None]]:
         """Map each required local checkpoint constituent, not just fused parameters.
 
@@ -2869,7 +2864,9 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                     continue
                 if name not in targets:
                     raise ValueError(f"Unexpected V4.1 expert tensor: {raw_name}")
-                tensor = self._expert_storage_tensor(tensor)
+                # Packed 8-bit checkpoint dtypes share raw byte storage.
+                if tensor.element_size() == 1:
+                    tensor = tensor.view(torch.uint8)
                 ffn = self.model.layers[layer_id].ffn
                 if ffn.use_mega_moe:
                     extra = ffn.experts.intermediate_size - config.moe_intermediate_size

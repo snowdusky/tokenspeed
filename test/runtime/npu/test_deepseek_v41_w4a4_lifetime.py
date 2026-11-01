@@ -162,14 +162,6 @@ def test_w4a4_experts_and_graph(group, mixed, max_rows, experts, top_k, routing)
             )
         clip = layer.act_quantizer_w1 if stage == 1 else layer.act_quantizer_w2
         clip.clip_factor_a.weight_loader(clip.clip_factor_a, torch.ones(1))
-    from tokenspeed.runtime.distributed.process_group_manager import (
-        process_group_manager,
-    )
-    from tokenspeed.runtime.utils.env import global_server_args_dict
-
-    layer.plan["process_group"] = process_group_manager.get_dedicated_device_group(
-        global_server_args_dict["mapping"].moe.ep_group, "ascend_mc2"
-    )
     layer.process_weights_after_loading(layer)
     rank = dist.get_rank()
     rows = (rank % 3) * (max_rows // 2) if mixed else max_rows
