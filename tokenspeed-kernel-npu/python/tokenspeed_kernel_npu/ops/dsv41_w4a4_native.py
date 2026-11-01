@@ -35,7 +35,7 @@ def _library():
     library.launch_w4a4.argtypes = (
         [ctypes.c_void_p] * 8 + [ctypes.c_int] * 3 + [ctypes.c_void_p]
     )
-    library.launch_w4a4.restype = None
+    library.launch_w4a4.restype = ctypes.c_int
     library.make_tiling.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
     library.make_tiling.restype = ctypes.c_int
     return library
@@ -71,7 +71,7 @@ def grouped_w4a4(quantized, weight, weight_scale, token_scale, counts, out):
     capacity, packed_k = quantized.shape
     experts, n, weight_k = weight.shape
     k = packed_k * 8
-    if (k, n) not in SUPPORTED_PROJECTIONS or weight_k != packed_k:
+    if (k, n) not in SUPPORTED_PROJECTIONS or n % 512 or weight_k != packed_k:
         raise ValueError("Unsupported V4.1 grouped INT4 geometry")
     if (
         weight_scale.shape != (experts, 1, n)
@@ -109,7 +109,7 @@ def grouped_w4a4(quantized, weight, weight_scale, token_scale, counts, out):
     scratch = torch.empty(
         (24, 2, 64, 512), dtype=torch.float16, device=quantized.device
     )
-    library.launch_w4a4(
+    status = library.launch_w4a4(
         *[
             ctypes.c_void_p(t.data_ptr())
             for t in (
@@ -128,4 +128,6 @@ def grouped_w4a4(quantized, weight, weight_scale, token_scale, counts, out):
         experts,
         ctypes.c_void_p(torch.npu.current_stream(quantized.device).npu_stream),
     )
+    if status != 0:
+        raise ValueError("Native W4A4 requires complete 512-column output tiles")
     return out

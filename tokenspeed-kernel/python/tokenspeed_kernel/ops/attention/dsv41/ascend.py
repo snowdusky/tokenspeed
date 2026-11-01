@@ -252,7 +252,19 @@ if current_platform().is_npu:
     def ascend_dsv41_index_score(*args):
         return portable.index_score(*args)
 
-    @_register_portable("index_topk", "x", {torch.bfloat16})
+    @register_kernel(
+        "attention",
+        "dsv41_index_topk",
+        name="ascend_dsv41_index_topk",
+        solution="ascend",
+        capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            "index_k_format": frozenset({"mxfp4"}),
+            "native_indexer": frozenset({False}),
+        },
+        priority=Priority.PORTABLE,
+    )
     def ascend_dsv41_index_topk(
         index_q,
         weights,

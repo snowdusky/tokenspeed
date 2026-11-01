@@ -61,3 +61,18 @@ def ascend_dspark_block_greedy_step(
         partials,
         output,
     )
+
+
+@register_kernel(
+    "sampling",
+    "dspark_block_greedy_resolve",
+    name="ascend_dspark_block_greedy_resolve",
+    solution="ascend",
+    capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+    signatures=format_signatures("candidates", "dense", {torch.int64}),
+    priority=Priority.PERFORMANT,
+)
+def ascend_dspark_block_greedy_resolve(candidates, output, step):
+    from tokenspeed_kernel_npu.ops.dspark_block import dspark_block_greedy_resolve
+
+    return dspark_block_greedy_resolve(candidates, output, step)

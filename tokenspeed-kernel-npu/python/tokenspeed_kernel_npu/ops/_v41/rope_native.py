@@ -31,7 +31,7 @@ def _function():
     fn = lib.launch_rope
     fn.argtypes = (
         [ctypes.c_void_p] * 3
-        + [ctypes.c_int] * 3
+        + [ctypes.c_int] * 4
         + [ctypes.c_int64] * 4
         + [ctypes.c_void_p]
     )
@@ -54,6 +54,7 @@ def rope_inplace(values, positions, cache):
             values.shape[0],
             1 if values.ndim == 2 else values.shape[1],
             values.shape[-1],
+            cache.shape[0],
             values.stride(0),
             64 if values.ndim == 2 else values.stride(1),
             p.stride(0),

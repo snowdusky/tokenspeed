@@ -731,16 +731,16 @@ class DeepseekV41Compressor(nn.Module):
                 else F.linear(x.float(), self.wkv_wgate.weight.float())
             )
             content, scores = projected.chunk(2, dim=-1)
-            content, positions, requests = self._compress(
-                owner, content, scores, backend, mode
+            content, positions, requests = backend.compress(
+                owner,
+                content,
+                scores,
+                mode,
+                self.norm.weight,
+                self.norm.variance_epsilon,
             )
             return content, positions, requests
         return _attention_norm(content, self.norm), positions, requests
-
-    def _compress(self, owner, content, scores, backend, mode):
-        return backend.compress(
-            owner, content, scores, mode, self.norm.weight, self.norm.variance_epsilon
-        )
 
 
 class DeepseekV41Indexer(nn.Module):
@@ -871,8 +871,6 @@ def _row_plan(layer_id: int, ced_decoder_start: int, ctx: ForwardContext) -> V41
 
 
 class DeepseekV41Attention(nn.Module):
-    compressor_cls = DeepseekV41Compressor
-
     def __init__(
         self,
         config,
@@ -949,7 +947,7 @@ class DeepseekV41Attention(nn.Module):
             interleave_linear_and_gate=False,
         )
         self.compressor = (
-            self.compressor_cls(config, layer_id, add_prefix("compressor", prefix))
+            DeepseekV41Compressor(config, layer_id, add_prefix("compressor", prefix))
             if self.is_kv_source
             else None
         )
@@ -1153,9 +1151,7 @@ class DeepseekV41Attention(nn.Module):
                             backend.plan_indexer_queries(
                                 self.layer_id, positions, requests, mode, index_group
                             )
-                            if hidden_states.is_cuda
-                            and mode.is_extend()
-                            and not mode.is_mixed()
+                            if mode.is_extend() and not mode.is_mixed()
                             else None
                         )
                         index_x, index_input, index_scale, index_positions = (
@@ -1704,13 +1700,13 @@ class DeepseekV41DecoderLayer(nn.Module):
             sinkhorn_iters=self.hc_sinkhorn_iters,
             prefer_overlap=decode_hc and can_overlap,
         )
+        if x is None:
+            x = _v41_hc_input(residual, attn_pre, self.ffn_norm)
         ffn_overlap = (
             can_overlap
             and ffn_mixes is None
             and (decode_hc or not is_breakable_capture_active())
         )
-        if x is None:
-            x = _v41_hc_input(residual, attn_pre, self.ffn_norm)
         defer_moe = (
             decode_hc
             and allow_ffn_reduce_fusion
@@ -1999,8 +1995,6 @@ class DeepseekV41Model(nn.Module):
         )
 
     def _configure_parallelism(self, mapping):
-        self.dp_replicated_rows = False
-        self.decoder_cpu_group = None
         local_fused_ep = (
             (get_moe_backend().is_gluon_petit() or get_moe_backend().is_mega_moe())
             and mapping.attn.tp_size
@@ -2463,7 +2457,6 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
     """V4.1 language and vision model with strict checkpoint coverage."""
 
     model_cls = DeepseekV41Model
-    supports_expert_placement = False
 
     def __init__(
         self,
@@ -2925,14 +2918,14 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                         f"{raw_name}: expected checkpoint FP8 E4M3, got {tensor.dtype}"
                     )
                 if not expects_fp8 and not name.endswith(".scale"):
-                    fp32 = (
-                        ".hc_" in name
-                        or ".act_quantizer_w" in name
-                        or name.endswith(
-                            (".attn_sink", ".ffn.gate.bias", ".ffn.gate.bias_vl")
-                        )
+                    fp32 = ".hc_" in name or name.endswith(
+                        (".attn_sink", ".ffn.gate.bias", ".ffn.gate.bias_vl")
                     )
-                    dtype = torch.float32 if fp32 else torch.bfloat16
+                    dtype = (
+                        param.dtype
+                        if self._is_expert_auxiliary_parameter(name)
+                        else torch.float32 if fp32 else torch.bfloat16
+                    )
                     if tensor.dtype != dtype:
                         raise TypeError(
                             f"{raw_name}: expected {dtype}, got {tensor.dtype}"

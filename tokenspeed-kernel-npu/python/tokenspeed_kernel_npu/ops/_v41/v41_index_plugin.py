@@ -49,6 +49,12 @@ def register():
         solution="ascend_native",
         capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
         signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            "index_heads": frozenset({32}),
+            "index_k_format": frozenset({"mxfp4"}),
+            "index_shards": frozenset({1, 2, 4, 8, 16, 32}),
+            "native_indexer": frozenset({False}),
+        },
         priority=Priority.SPECIALIZED,
     )
     def index(

@@ -99,6 +99,18 @@ def prepare_hccl_tp_groups(group: Group, *, nprocs_per_node: int) -> bool:
         "TOKENSPEED_HCCL_TP_AIV_MAX_BYTES",
     )
     values = [os.environ.get(name) for name in names]
+    if len(group) > 1 and torch.distributed.is_initialized():
+        # All ranks enter even when this rank has no policy. Refuse mismatches
+        # before any rank creates an AIV communicator or changes reduction dtype.
+        if pg_manager.get_device_process_group(group).size() != len(group):
+            return False
+        pg_manager.init_process_group(group, backend="gloo")
+        policies = [None] * len(group)
+        torch.distributed.all_gather_object(
+            policies, values, group=pg_manager.get_process_group("gloo", group)
+        )
+        if any(candidate != policies[0] for candidate in policies):
+            raise ValueError("HCCL TP policy settings must agree across the rank group")
     if all(value is None for value in values):
         return False
     if any(value is None for value in values):

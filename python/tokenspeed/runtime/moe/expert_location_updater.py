@@ -52,7 +52,6 @@ from __future__ import annotations
 import hashlib
 import logging
 from collections.abc import Mapping, Sequence
-from typing import Protocol, runtime_checkable
 
 import torch
 import torch.distributed as dist
@@ -254,20 +253,14 @@ class ExpertLocationUpdater:
                 tensor[dst_slot].copy_(tensor[src_slot])
 
 
-@runtime_checkable
-class _ExpertTransport(Protocol):
-    """Expert modules expose their transport independently of their implementation."""
-
-    @property
-    def supports_all_to_all_ep(self) -> bool: ...
-
-
 def _all_to_all_ep(model: torch.nn.Module) -> bool:
     """Whether the model's MoE layers own all-to-all dispatch (uniform over layers)."""
+    from tokenspeed.runtime.layers.moe.expert import MoELayer
+
     flags = {
         module.supports_all_to_all_ep
         for module in model.modules()
-        if isinstance(module, _ExpertTransport)
+        if isinstance(module, MoELayer)
     }
     if len(flags) != 1:
         raise ValueError(

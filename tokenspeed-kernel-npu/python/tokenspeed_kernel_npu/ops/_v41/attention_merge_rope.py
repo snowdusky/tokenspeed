@@ -22,7 +22,7 @@
 from tokenspeed_kernel_npu._triton import tl, triton
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["parts"])
 def merge_rope(
     P,
     S,
@@ -31,8 +31,9 @@ def merge_rope(
     L,
     Positions,
     CosSin,
+    max_positions,
     heads: tl.constexpr,
-    parts: tl.constexpr,
+    parts,
     PS: tl.constexpr,
     H: tl.constexpr,
     HEAD_CAPACITY: tl.constexpr,
@@ -72,7 +73,9 @@ def merge_rope(
     y = y.to(tl.bfloat16).to(tl.float32)
     partner = tl.gather(y, tl.broadcast_to((d ^ 1)[None, :], (H, 512)), 1)
     position = tl.maximum(tl.load(Positions + row), 0).to(tl.int64)
-    rotary = d >= 448
+    valid = position < max_positions
+    tl.device_assert(valid, "RoPE position is outside the cosine/sine table")
+    rotary = (d >= 448) & valid
     offset = (d - 448) // 2
     cosine = tl.load(CosSin + position * 64 + offset, rotary, other=1.0)
     sine = tl.load(CosSin + position * 64 + 32 + offset, rotary, other=0.0)
@@ -90,7 +93,7 @@ def merge_rope(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["parts"])
 def merge_rope_scalar(
     P,
     S,
@@ -99,8 +102,9 @@ def merge_rope_scalar(
     L,
     Positions,
     CosSin,
+    max_positions,
     heads,
-    parts: tl.constexpr,
+    parts,
     PS: tl.constexpr,
     HEAD_CAPACITY: tl.constexpr,
 ):
@@ -131,7 +135,9 @@ def merge_rope_scalar(
     y = y.to(tl.bfloat16).to(tl.float32)
     partner = tl.gather(y, d ^ 1, 0)
     position = tl.maximum(tl.load(Positions + row), 0).to(tl.int64)
-    rotary = d >= 448
+    valid = position < max_positions
+    tl.device_assert(valid, "RoPE position is outside the cosine/sine table")
+    rotary = (d >= 448) & valid
     offset = (d - 448) // 2
     cosine = tl.load(CosSin + position * 64 + offset, rotary, other=1.0)
     sine = tl.load(CosSin + position * 64 + 32 + offset, rotary, other=0.0)

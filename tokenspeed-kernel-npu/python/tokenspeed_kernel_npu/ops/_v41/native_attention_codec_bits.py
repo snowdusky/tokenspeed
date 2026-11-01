@@ -51,7 +51,7 @@ def make_tables(device):
     return torch.cat([pairs, e4, e8]).int().to(device)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["parts"])
 def merge(
     P,
     S,
@@ -59,7 +59,7 @@ def merge(
     O,
     L,
     heads,
-    parts: tl.constexpr,
+    parts,
     PS: tl.constexpr,
     HEAD_CAPACITY: tl.constexpr,
 ):
@@ -203,7 +203,7 @@ class Native:
             device=q.device,
         )
         self.out = torch.empty_like(q)
-        self.lse = torch.empty(q.shape[:2], device=q.device)
+        self.lse = torch.empty(q.shape[:2], dtype=torch.float32, device=q.device)
 
     def run(self, *, rotary=None):
         if rotary is not None:
@@ -279,6 +279,7 @@ class Native:
                     self.lse,
                     positions,
                     cache,
+                    cache.shape[0],
                     self.heads,
                     self.parts,
                     triton.next_power_of_2(self.parts),
@@ -295,6 +296,7 @@ class Native:
                     self.lse,
                     positions,
                     cache,
+                    cache.shape[0],
                     self.heads,
                     self.parts,
                     triton.next_power_of_2(self.parts),

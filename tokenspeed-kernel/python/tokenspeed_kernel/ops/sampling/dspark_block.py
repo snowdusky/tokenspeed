@@ -23,7 +23,9 @@
 import torch
 from tokenspeed_kernel.ops.sampling.triton.dspark_block import (
     dspark_block_candidate_tiles,
-    dspark_block_greedy_resolve,
+)
+from tokenspeed_kernel.ops.sampling.triton.dspark_block import (
+    dspark_block_greedy_resolve as triton_resolve,
 )
 from tokenspeed_kernel.ops.sampling.triton.dspark_block import (
     dspark_block_greedy_step as triton_step,
@@ -52,6 +54,31 @@ register_kernel(
     signatures=format_signatures("base_logits", "dense", {torch.float32}),
     priority=Priority.PORTABLE,
 )(triton_step)
+
+
+register_kernel(
+    "sampling",
+    "dspark_block_greedy_resolve",
+    name="triton_dspark_block_greedy_resolve",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=format_signatures("candidates", "dense", {torch.int64}),
+    priority=Priority.PORTABLE,
+)(triton_resolve)
+
+
+def dspark_block_greedy_resolve(
+    candidates: torch.Tensor, output: torch.Tensor, step: int
+) -> None:
+    """Write gathered [tp,rows,tiles] INT64 winners into INT32 output[:,step]."""
+    if candidates.ndim != 3 or candidates.dtype != torch.int64:
+        raise ValueError("candidates must be [tp, rows, n_tiles] INT64")
+    kernel = select_kernel(
+        "sampling",
+        "dspark_block_greedy_resolve",
+        format_signature(candidates=dense_tensor_format(candidates.dtype)),
+    )
+    kernel(candidates, output, step)
 
 
 def dspark_block_greedy_step(

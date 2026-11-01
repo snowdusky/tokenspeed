@@ -204,30 +204,7 @@ class Ascend910MLP(DeepseekV4MLP):
         )[0]
 
 
-class Ascend910Compressor(shared.DeepseekV41Compressor):
-    def _compress(self, owner, content, scores, backend, mode):
-        # LCM owns history; masked device operations avoid dynamic NonZero in ACL capture.
-        active, positions, requests, previous, slots, write_slots = (
-            backend.query_metadata(mode).compressor
-        )
-        tail = backend.cache_pool.compressor_tail(owner)
-        pooled = dsv41.compressor_pool(
-            content,
-            scores,
-            previous,
-            tail,
-            slots,
-            active,
-            None,
-            self.norm.weight,
-            self.norm.variance_epsilon,
-        )
-        dsv41.compressor_tail_scatter(content, scores, tail, write_slots)
-        return pooled, positions, requests
-
-
 class Ascend910Attention(shared.DeepseekV41Attention):
-    compressor_cls = Ascend910Compressor
 
     def _configure_output_geometry(self, config, mapping):
         self.n_local_groups = max(1, config.o_groups // mapping.attn.tp_size)

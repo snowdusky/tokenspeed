@@ -22,7 +22,7 @@
 from tokenspeed_kernel_npu._triton import tl, triton
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["parts"])
 def grouped_merge(
     P,
     S,
@@ -30,7 +30,7 @@ def grouped_merge(
     O,
     L,
     heads: tl.constexpr,
-    parts: tl.constexpr,
+    parts,
     PS: tl.constexpr,
     H: tl.constexpr,
     HEAD_CAPACITY: tl.constexpr,

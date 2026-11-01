@@ -24,25 +24,39 @@ from __future__ import annotations
 
 from threading import Lock
 from typing import Any
+from weakref import finalize
 
 
 class CopyStreamPool:
-    """Lend a stream until its result is committed, never to two pending results.
+    """Lend a stream until its copies complete, never to two pending results.
 
-    The forward thread acquires streams; the commit thread returns them only
-    after synchronization. In-flight depth therefore bounds the pool's size.
+    Commit returns streams after synchronization. Discarded results retain
+    their sources until a later lease observes completion with a device query.
     """
 
     def __init__(self, device_module: Any, device: Any) -> None:
         self.device_module = device_module
         self.device = device
         self._available: list[Any] = []
+        self._retired: list[tuple[Any, tuple[Any, ...]]] = []
         self._lock = Lock()
+        self._retirement_finalizer = finalize(
+            self, self._drain_retired, device_module, device, self._retired
+        )
 
     def copy_after(
         self, producer: Any, sources: tuple[Any, ...]
     ) -> CopyStreamCompletion:
         with self._lock:
+            if self._retired:
+                pending = []
+                with self.device_module.device(self.device):
+                    for retired_stream, retired_sources in self._retired:
+                        if retired_stream.query():
+                            self._available.append(retired_stream)
+                        else:
+                            pending.append((retired_stream, retired_sources))
+                self._retired[:] = pending
             stream = self._available.pop() if self._available else None
         if stream is None:
             stream = self.device_module.Stream(device=self.device)
@@ -51,6 +65,20 @@ class CopyStreamPool:
     def _release(self, stream: Any) -> None:
         with self._lock:
             self._available.append(stream)
+
+    def _retire(self, stream: Any, sources: tuple[Any, ...]) -> None:
+        # Discard may run on the forward thread. Retain sources and reap only
+        # completed copies at the next lease, without synchronizing that thread.
+        with self._lock:
+            self._retired.append((stream, sources))
+
+    @staticmethod
+    def _drain_retired(device_module, device, retired) -> None:
+        if retired:
+            with device_module.device(device):
+                for stream, sources in retired:
+                    stream.synchronize()
+            retired.clear()
 
 
 class CopyStreamCompletion:
@@ -75,6 +103,7 @@ class CopyStreamCompletion:
         self._context: Any = None
         self._sealed = False
         self._synced = False
+        self._discard_finalizer = finalize(self, pool._retire, stream, sources)
 
     def __enter__(self) -> CopyStreamCompletion:
         self.stream.wait_stream(self._producer)
@@ -103,6 +132,7 @@ class CopyStreamCompletion:
         # synchronizing the producer could wait on future, undispatched peers.
         with self._pool.device_module.device(self._pool.device):
             self.stream.synchronize()
+        self._discard_finalizer.detach()
         self._sources = ()
         self._synced = True
         self._pool._release(self.stream)

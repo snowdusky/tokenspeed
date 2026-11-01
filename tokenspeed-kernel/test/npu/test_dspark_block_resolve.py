@@ -25,9 +25,9 @@ import torch
 import torch_npu
 from tokenspeed_kernel.ops.sampling.dspark_block import (
     dspark_block_candidate_tiles,
+    dspark_block_greedy_resolve,
     dspark_block_greedy_step,
 )
-from tokenspeed_kernel_npu.ops.dspark_block import dspark_block_greedy_resolve
 
 
 @pytest.mark.parametrize("rows", [1, 4])

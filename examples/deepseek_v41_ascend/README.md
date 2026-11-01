@@ -125,3 +125,25 @@ its measured 128K/1000 decode cost must not be attributed to MC2. Compare
 performance at identical topology, Engram placement, input/output lengths,
 per-card concurrency and graph sizes. In particular, an online EPLB result
 requires an actual applied placement and includes migration stalls.
+
+
+## Ascend completion and layout contracts
+
+Output copies use a stream leased to one result. Commit waits for that stream,
+whose queue contains only that result's copies; it does not synchronize a
+producer carrying later collectives. Discarded results retire their leases and
+retain source tensors until a nonblocking completion query allows reuse.
+Pool teardown drains the remaining retired copies.
+
+MC2 routes rank-local rows, so its expert-load mask covers this rank's live
+rows. Gather-based expert execution retains the existing gathered-row mask.
+W4A4's native grouped provider uses direct packed NZ conversion with
+`npu_format_cast(..., customize_dtype=3)` on the supported CANN stack. Callers
+must explicitly select `native_packed_nz`; the native provider requires complete
+512-column output tiles and rejects partial tiles at its launch boundary.
+
+DSpark's step and final resolve both dispatch through the kernel registry.
+Indexer query partitioning applies only to sufficiently large encoder-prefill
+Full sources; decode, mixed batches, CED-tail Reindex and candidate-producing
+layers keep their original execution. Eligible NPU prefills partition the query
+projection as well as scoring.

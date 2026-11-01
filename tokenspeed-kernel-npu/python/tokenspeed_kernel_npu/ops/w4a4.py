@@ -174,7 +174,7 @@ def prepare_w4a4_moe_weights(
     second,
     *,
     transposed: bool,
-    native_packed_nz: bool = False,
+    native_packed_nz: bool,
 ) -> W4A4MoePlan:
     """Convert checkpoint INT32 tensors to NZ without changing their INT4 layout.
 
@@ -343,6 +343,7 @@ def ascend_int4_process_moe_weights(*, plan: dict, w: torch.nn.Module) -> None:
         first,
         second,
         transposed=w.w4a4_gmm_is_transposed,
+        native_packed_nz=False,
     )
     w.w13_weight.data = w._int4_plan.w13
     w.w2_weight.data = w._int4_plan.w2
