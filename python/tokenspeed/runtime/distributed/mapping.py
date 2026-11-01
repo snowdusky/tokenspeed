@@ -102,6 +102,7 @@ def _make_parallelism_group(rank: int, size: int, stride: int = 1) -> Group:
 
 
 class MappingBase:
+
     def __init__(self, rank: int | None = None, world_size: int = 1):
         assert rank is None or rank >= 0
         self._rank = rank
@@ -133,6 +134,7 @@ class MappingBase:
 
 
 class DenseLayerMapping(MappingBase):
+
     def __init__(
         self,
         rank: int | None = None,
@@ -231,6 +233,7 @@ def _resolve_head_tp_size(
 
 
 class AttentionLayerMapping(MappingBase):
+
     def __init__(
         self,
         rank: int | None = None,
@@ -602,6 +605,7 @@ def _resolve_lm_head_tp_size(
 
 
 class Mapping(MappingBase):
+
     def __init__(
         self,
         rank: int | None = None,
