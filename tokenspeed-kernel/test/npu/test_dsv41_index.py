@@ -227,3 +227,43 @@ def test_long_history_full_selection_and_live_acl_metadata():
                 atol=0,
                 rtol=0,
             )
+
+
+@pytest.mark.parametrize("layout", ["shared", "pairs", "different"])
+def test_grouped_query_selection_preserves_live_page_mapping(layout):
+    # Six rows use grouped key decode; one-row chunks independently exercise
+    # the same public numerical contract without sharing decoded keys.
+    q, weights, cache, _ = inputs(6, heads=32, history=8192)
+    pages = torch.arange(64, dtype=torch.int32)[None].repeat(6, 1)
+    if layout == "pairs":
+        pages += (torch.arange(6, dtype=torch.int32) // 2 % 2)[:, None] * 64
+    elif layout == "different":
+        pages += (torch.arange(6, dtype=torch.int32) % 2)[:, None] * 64
+    visible = torch.tensor([4096, 4001, 3073, 2049, 127, 0], dtype=torch.int32)
+    qn, wn, tn, vn = (x.to("npu") for x in (q, weights, pages, visible))
+
+    def run(chunk):
+        return ops.index_topk(
+            qn, wn, cache, tn, vn, None, 16, 32, 8, chunk, 2048, None, None, None
+        )
+
+    expected = run(1)
+    actual = run(6)
+    for got, want in zip(actual, expected, strict=True):
+        torch.testing.assert_close(got, want, atol=0, rtol=0)
+    for _ in range(2):
+        run(6)
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph, auto_dispatch_capture=True):
+        captured = run(6)
+    # Adjacent queries can change from shared to distinct pages at replay.
+    pages[1, 7:11] = torch.tensor([70, -1, 72, 73], dtype=torch.int32)
+    pages[4, 20] = -1
+    visible = torch.tensor([2049, 1023, 63, 2048, 3071, 1], dtype=torch.int32)
+    tn.copy_(pages)
+    vn.copy_(visible)
+    graph.replay()
+    torch.npu.synchronize()
+    for got, want in zip(captured, run(1), strict=True):
+        torch.testing.assert_close(got, want, atol=0, rtol=0)

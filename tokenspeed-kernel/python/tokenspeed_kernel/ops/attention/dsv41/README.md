@@ -39,3 +39,11 @@ before starting the workers. Default BF16 collective reduction order can vary
 between repeated eager calls as well as between eager and captured execution.
 Checkpoint expansion and Engram lookup use bounded worker grids so real expert
 shards and long prefill hash batches stay within Ascend's launch-grid limit.
+
+
+Ascend full-history scans can share a bounded decoded key tile across three
+query pairs. Each replay checks physical page equality on device and retains
+independent scoring for divergent pages. Short histories retain independent
+pair scheduling to keep the cores occupied. Query grouping preserves BF16 dot,
+weighted-product and shard-reduction rounding; it does not change the cache
+format or retain request state. Candidate scans retain pair-wise decoding.

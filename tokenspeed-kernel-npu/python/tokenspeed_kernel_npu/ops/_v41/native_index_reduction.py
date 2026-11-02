@@ -21,13 +21,14 @@
 
 """Mixed Cube/Vector packed-FP4 index scan for Ascend 910B.
 
-Physical page equality is checked on device before sharing keys between two
-query rows. Different requests, partial pages and replay-time page changes
-retain independent scores. The native kernel preserves the existing BF16
+Physical page equality is checked on device before sharing decoded keys across
+query rows. Full scans may group three query pairs in bounded scratch. Different
+requests, partial pages and replay-time page changes retain independent scores. The native kernel preserves the existing BF16
 rounding boundaries and rank-ordered shard reduction.
 """
 
 import ctypes
+import math
 from functools import lru_cache
 from pathlib import Path
 
@@ -37,14 +38,31 @@ import torch
 @lru_cache(maxsize=1)
 def _library():
     library = ctypes.CDLL(str(Path(__file__).with_name("libindex_scan_reduction.so")))
-    library.launch_scan.argtypes = (
+    library.launch_grouped_scan.argtypes = (
         [ctypes.c_void_p] * 7
-        + [ctypes.c_int] * 7
+        + [ctypes.c_int] * 8
         + [ctypes.c_int64]
         + [ctypes.c_void_p] * 3
     )
-    library.launch_scan.restype = None
+    library.launch_grouped_scan.restype = ctypes.c_int
     return library
+
+
+_SHARED_QUERY_ROWS = 6
+
+
+def _query_pairs(rows, width, shards, candidates):
+    # Three pairs fit the 64-KiB query L0A and the Vector UB. Page equality
+    # remains a live device check, including during graph replay.
+    return (
+        _SHARED_QUERY_ROWS // 2
+        if candidates is None
+        and shards == 1
+        and rows >= _SHARED_QUERY_ROWS
+        and rows % _SHARED_QUERY_ROWS == 0
+        and width >= 4096
+        else 1
+    )
 
 
 def scan_scores(q, weights, cache, table, visible, out, *, shards, parts, candidates):
@@ -52,7 +70,7 @@ def scan_scores(q, weights, cache, table, visible, out, *, shards, parts, candid
 
     Inputs are BF16 Q [T,32,128], BF16 weights [T,32], packed FP4 cache
     [pages,64,68], INT32 page table [T,P] and visible lengths [T].
-    Parts is the number of disjoint historical partitions per query pair.
+    Parts is the number of disjoint historical partitions per query group.
     Unsupported metadata is rejected before launch. Graph replay reads fresh
     page IDs and lengths; no host tensor reads or persistent request state.
     """
@@ -106,12 +124,15 @@ def scan_scores(q, weights, cache, table, visible, out, *, shards, parts, candid
         visible.contiguous(),
         out,
     ]
+    query_pairs = _query_pairs(n, width, shards, candidates)
     workspace = torch.empty(
-        24 * 2 * (64 * 128 + 2 * 128 * 128), device=q.device, dtype=torch.bfloat16
+        query_pairs * 24 * 2 * (64 * 128 + 2 * 128 * 128),
+        device=q.device,
+        dtype=torch.bfloat16,
     )
     tables = make_tables(q.device)
     inputs.append(workspace)
-    library.launch_scan(
+    status = library.launch_grouped_scan(
         *[ctypes.c_void_p(t.data_ptr()) for t in inputs],
         n,
         width,
@@ -120,11 +141,14 @@ def scan_scores(q, weights, cache, table, visible, out, *, shards, parts, candid
         shards,
         table.shape[1],
         int(candidates is not None),
+        query_pairs,
         cache.stride(0),
         ctypes.c_void_p(tables.data_ptr()),
         ctypes.c_void_p(0 if candidates is None else candidates.data_ptr()),
         ctypes.c_void_p(torch.npu.current_stream(q.device).npu_stream),
     )
+    if status:
+        raise ValueError("Unsupported native index query grouping")
     return out
 
 
@@ -149,9 +173,13 @@ def scores(q, weights, cache, table, visible, candidates, width, shards):
     output = torch.full(
         (q.shape[0], width), -torch.inf, dtype=torch.float32, device=q.device
     )
-    parts = max(
-        1, min(24, (24 + (q.shape[0] + 1) // 2 - 1) // max(1, (q.shape[0] + 1) // 2))
-    )
+    query_pairs = _query_pairs(q.shape[0], width, shards, candidates)
+    if query_pairs > 1:
+        groups = q.shape[0] // (2 * query_pairs)
+        parts = math.lcm(query_pairs, 24 // math.gcd(24, groups))
+    else:
+        groups = max(1, (q.shape[0] + 1) // 2)
+        parts = max(1, min(24, (24 + groups - 1) // groups))
     return scan_scores(
         q,
         weights,
