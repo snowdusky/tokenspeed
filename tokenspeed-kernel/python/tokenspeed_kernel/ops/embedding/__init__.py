@@ -20,7 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.platform import on_accelerator, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -455,7 +455,7 @@ def mxfp8_embedding(weight, scales, indices, row_start, row_end):
     if not 0 <= row_start <= row_end <= row_start + weight.shape[0]:
         raise ValueError("MXFP8 embedding shard range exceeds table capacity")
     if (
-        indices.device.type not in ("cuda", "npu")
+        not on_accelerator(indices)
         or indices.dtype not in (torch.int32, torch.int64)
         or (not indices.is_contiguous() and indices.ndim != 2)
         or weight.stride(1) != 1
@@ -464,7 +464,7 @@ def mxfp8_embedding(weight, scales, indices, row_start, row_end):
         or scales.device != indices.device
     ):
         raise ValueError(
-            "MXFP8 embedding requires colocated GPU tensors, contiguous table "
+            "MXFP8 embedding requires colocated accelerator tensors, contiguous table "
             "columns, and contiguous or two-dimensional IDs"
         )
     kernel = select_kernel(

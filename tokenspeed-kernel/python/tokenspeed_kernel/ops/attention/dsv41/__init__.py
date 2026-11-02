@@ -52,6 +52,7 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel.ops.attention.dsv41._inputs import IndexKeyInput, IndexQueryInput
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import bounded_group_slots
+from tokenspeed_kernel.platform import on_accelerator
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -754,7 +755,7 @@ def _validate_rope(values, positions, cos_sin_cache):
         raise ValueError(
             "V4.1 RoPE values must be BF16/FP16 [tokens,dim] or [tokens,heads,dim]"
         )
-    if values.device.type not in ("cuda", "npu") or values.stride(-1) != 1:
+    if not on_accelerator(values) or values.stride(-1) != 1:
         raise ValueError(
             "V4.1 RoPE requires device values with contiguous head channels"
         )
@@ -916,7 +917,7 @@ def rope_pad_query(
 def dspark_rows_supported(values: torch.Tensor) -> bool:
     """Whether BF16 [...,512] rows can use the registered DSpark device kernels."""
     if (
-        values.device.type in ("cpu", "meta")
+        not on_accelerator(values)
         or values.ndim not in (2, 3)
         or values.dtype != torch.bfloat16
         or values.shape[-1] != 512
@@ -1448,7 +1449,7 @@ def index_select_all(page_table, visible_lens, pages, candidate_block_size, out)
             raise ValueError(
                 "All-history outputs must be contiguous int32 destinations"
             )
-    if page_table.device.type in ("cuda", "npu"):
+    if on_accelerator(page_table):
         return _kernel("index_select_all", page_table)(
             page_table, visible_lens, pages, candidate_block_size, out
         )

@@ -101,7 +101,7 @@ from tokenspeed_kernel.ops.residual import (
     mhc_apply_pre_quantize_fp8,
     try_mhc_shifted_post_pre_norm,
 )
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, on_accelerator
 from tokenspeed_kernel.selection import NoKernelFoundError
 from torch import nn
 
@@ -177,7 +177,10 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalInputs,
 )
 from tokenspeed.runtime.utils import add_prefix
-from tokenspeed.runtime.utils.device_stream import StreamFork
+from tokenspeed.runtime.utils.device_stream import (
+    StreamFork,
+    is_current_stream_capturing,
+)
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = logging.getLogger(__name__)
@@ -464,7 +467,7 @@ def _column(input_size, output_size, dtype, quant_config, prefix, mapping):
 
 def _norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
     """RMSNorm in the reference cast order: FP32 scale, FP32 weight, one round."""
-    if x.device.type in ("cuda", "npu"):
+    if on_accelerator(x):
         from tokenspeed_kernel.ops.layernorm import reference_rmsnorm
 
         return reference_rmsnorm(x, norm.weight, norm.variance_epsilon, None)
@@ -560,7 +563,7 @@ class DeepseekV41RotaryEmbedding(nn.Module):
 
     def _prepare_cache(self, device: torch.device) -> None:
         if self.cos_sin_cache is None or self.cos_sin_cache.device != device:
-            if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            if is_current_stream_capturing(device):
                 raise RuntimeError("Warm up V4.1 RoPE before graph capture")
             key = (self._table_key, device)
             table = _ROPE_TABLES.get(key)
@@ -583,7 +586,7 @@ class DeepseekV41RotaryEmbedding(nn.Module):
         self, x: torch.Tensor, positions: torch.Tensor, inverse: bool
     ) -> torch.Tensor:
         """Rotate only x's trailing RoPE dimensions at absolute token positions."""
-        if x.device.type not in ("cuda", "npu"):
+        if not on_accelerator(x):
             angles = positions.clamp_min(0).float().unsqueeze(-1) * self.inv_freq
             freqs = torch.polar(torch.ones_like(angles), angles)
             if inverse:
@@ -604,7 +607,7 @@ class DeepseekV41RotaryEmbedding(nn.Module):
         self, x: torch.Tensor, positions: torch.Tensor, inverse: bool
     ) -> torch.Tensor:
         """Rotate a fresh projection/output in place; never pass shared latents before index K reads them."""
-        if x.device.type not in ("cuda", "npu"):
+        if not on_accelerator(x):
             return self(x, positions, inverse)
         self._prepare_cache(x.device)
         cache = self.inverse_cos_sin_cache if inverse else self.cos_sin_cache
@@ -621,7 +624,7 @@ def v41_hc_mixes(
     sinkhorn_iters: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Derive pre/post/comb from the full HC stream; comb is [input HC, output HC]."""
-    if x.device.type in ("cuda", "npu"):
+    if on_accelerator(x):
         from tokenspeed_kernel.ops.residual import mhc_mixes
 
         return mhc_mixes(x, weight, scale, base, norm_eps, hc_eps, sinkhorn_iters)
@@ -644,7 +647,7 @@ def v41_hc_mixes(
 
 def v41_hc_pre(x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
     """Collapse copies with the PREVIOUS sublayer's pre-mix, accumulating FP32."""
-    if x.device.type not in ("cuda", "npu"):
+    if not on_accelerator(x):
         return (pre_mix.unsqueeze(-1) * x.float()).sum(-2).to(x.dtype)
     from tokenspeed_kernel.ops.residual import mhc_apply_pre
 
@@ -655,7 +658,7 @@ def v41_hc_post(
     x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor
 ) -> torch.Tensor:
     """Apply the current sublayer's post/comb, summing input—not output—HC copies."""
-    if x.device.type not in ("cuda", "npu"):
+    if not on_accelerator(x):
         mixed = (comb.unsqueeze(-1) * residual.float().unsqueeze(-2)).sum(-3)
         return (post.unsqueeze(-1) * x.float().unsqueeze(-2) + mixed).to(x.dtype)
     from tokenspeed_kernel.ops.residual import mhc_post
@@ -664,7 +667,7 @@ def v41_hc_post(
 
 
 def _v41_hc_input(x: torch.Tensor, pre: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
-    if x.device.type not in ("cuda", "npu"):
+    if not on_accelerator(x):
         return _norm(v41_hc_pre(x, pre), norm)
     from tokenspeed_kernel.ops.residual import mhc_apply_pre
 
@@ -1090,7 +1093,7 @@ class DeepseekV41Attention(nn.Module):
             # Both reference methods consume canonical group-32 UE8M0 scales
             # and reuse their prepared weight scales where the native GEMM runs.
             index_q_input, index_q_scale = q_input, q_scale
-        if hidden_states.device.type in ("cuda", "npu"):
+        if on_accelerator(hidden_states):
             # Lazy shared constants are produced before the fork event, so both
             # branches observe them even on the first eager decode after loading.
             self.rotary_emb._prepare_cache(hidden_states.device)
@@ -1598,7 +1601,7 @@ class DeepseekV41DecoderLayer(nn.Module):
             return residual[:0], pre_mix[:0], None, captured
         decode_hc = ctx.forward_mode.is_decode()
         can_overlap = (
-            hidden_states.device.type in ("cuda", "npu")
+            on_accelerator(hidden_states)
             and self.hc_stream_fork.aux_stream is not None
             and self.hc_stream_fork.aux_stream.device == hidden_states.device
         )
@@ -1957,13 +1960,13 @@ class DeepseekV41Model(nn.Module):
         device = self.embed_tokens.weight.device
         self.aux_stream = (
             torch.get_device_module(device).Stream(device=device)
-            if device.type in ("cuda", "npu")
+            if on_accelerator(device)
             else None
         )
         # HC must also overlap the attention/index and shared-expert branches.
         self.hc_stream = (
             torch.get_device_module(device).Stream(device=device)
-            if device.type in ("cuda", "npu")
+            if on_accelerator(device)
             else None
         )
         self.layers = nn.ModuleList(

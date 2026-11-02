@@ -119,6 +119,11 @@ class DeepseekV41Config(SoftmaxAttnConfig):
             raise ValueError(
                 "V4.1 indexer query parallel size must be 1 or attention TP"
             )
+        if query_size > 1 and attn.kvp_size != 1 and current_platform().is_npu:
+            raise ValueError(
+                "Ascend V4.1 indexer QCP requires replicated KV "
+                "(--kv-parallel-size 1)"
+            )
         query_rank = attn.tp_rank if query_size > 1 else 0
         query_group = (
             attn.tp_group if query_size > 1 else (attn.tp_group[attn.tp_rank],)

@@ -20,6 +20,10 @@ family for fused-row support. Engram resolves its table mapping at construction
 and reuses the common gate calculation. Shared attention and hyperconnection
 branches use the device-neutral stream utility.
 
+Indexer query parallelism on Ascend requires replicated KV
+(`--kv-parallel-size 1`); unsupported QCP/KVP combinations fail at startup.
+RoPE tables must be warmed up before graph capture on each accelerator.
+
 The TP8 recipe explicitly selects FP32 accumulation for BF16 reductions and
 AIV transport for reductions and gathers up to 2 MiB. The same policy supports
 aligned, contiguous TP2 and TP4 groups within one node. Larger messages keep

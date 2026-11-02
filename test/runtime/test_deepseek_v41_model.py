@@ -2042,6 +2042,17 @@ def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
     assert ctx.collective_num_tokens is None
 
 
+@pytest.mark.parametrize("kind", ["cuda", "privateuseone"])
+def test_rope_requires_warmup_before_any_device_capture(kind, monkeypatch):
+    config = _config()
+    rope = DeepseekV41RotaryEmbedding(config, 0)
+    module = Mock(is_current_stream_capturing=Mock(return_value=True))
+    monkeypatch.setattr(torch, "get_device_module", lambda device: module)
+    with pytest.raises(RuntimeError, match="Warm up V4.1 RoPE before graph capture"):
+        rope._prepare_cache(torch.device(kind))
+    assert rope.cos_sin_cache is None and rope.inverse_cos_sin_cache is None
+
+
 def test_upstream_rope_and_hc_methods():
     root = os.environ.get("DEEPSEEK_V41_REFERENCE_DIR")
     if root is None:

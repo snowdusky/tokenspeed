@@ -24,7 +24,7 @@ import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import resolve_group_slot
 from tokenspeed_kernel.ops.layernorm.triton import reference_rmsnorm_row
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import CapabilityRequirement, on_accelerator
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
@@ -394,10 +394,10 @@ def _scale_bytes(cache_format):
 
 
 def _same_device(x, tensors):
-    if x.device.type not in ("cuda", "npu") or any(
+    if not on_accelerator(x) or any(
         t.device != x.device for t in tensors if t is not None
     ):
-        raise ValueError("all tensors must share a CUDA/ROCm or Ascend device")
+        raise ValueError("all tensors must share an accelerator device")
 
 
 def _integers(x, shape, name):

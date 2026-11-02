@@ -1068,6 +1068,53 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
     assert all(spec.transfer_policy is None for spec in specs.values())
 
 
+@pytest.mark.parametrize("vendor", ["nvidia", "ascend"])
+@pytest.mark.parametrize("kvp_size", [1, 2])
+@pytest.mark.parametrize("query_size", [1, 4])
+def test_indexer_qcp_launch_validates_only_unsupported_ascend_layout(
+    vendor, kvp_size, query_size
+):
+    hf = _recipe("cpu").model_config.hf_config
+    hf.candidate_topk_blocks, hf.candidate_block_size, hf.index_topk = 2, 8, 4
+    args = ServerArgs(
+        model="x",
+        device="cpu",
+        attn_tp_size=4,
+        kv_parallel_size=kvp_size,
+        decode_context_parallel_size=kvp_size,
+        deepseek_v41_indexer_query_parallel_size=query_size,
+        max_num_seqs=4,
+        chunked_prefill_size=512,
+        max_total_tokens=1024,
+        kv_cache_quant_method="none",
+        disable_prefill_graph=True,
+        enable_mixed_batch=False,
+        disaggregation_mode="null",
+        speculative_algorithm=None,
+    )
+    args.mapping.rank = 0
+    model = SimpleNamespace(
+        hf_config=hf,
+        num_attention_layers=40,
+        num_attention_heads=4,
+        dtype=torch.bfloat16,
+        context_len=512,
+    )
+    platform = replace(current_platform(), vendor=vendor)
+    with patch(
+        "tokenspeed.runtime.layers.attention.configs.deepseek_v41.current_platform",
+        return_value=platform,
+    ):
+        if vendor == "ascend" and kvp_size > 1 and query_size > 1:
+            with pytest.raises(ValueError, match="indexer QCP requires replicated KV"):
+                DeepseekV41Config.generate(args, model, False)
+        else:
+            config = DeepseekV41Config.generate(args, model, False)
+            spec = config.component(DeepseekV41Config)
+            assert config.kvp_size == kvp_size
+            assert len(spec.indexer_query_group) == query_size
+
+
 def test_pool_reports_the_whole_arena_as_kv_bytes():
     # The startup memory summary reads this; without it the arena is
     # misattributed to activations and the KV row prints 0.
@@ -2903,15 +2950,23 @@ def test_index_geometry_scope_preserves_all_indexer_selections_in_graph(monkeypa
         (ForwardMode.EXTEND, 2, 8192, 65536, object(), False),
     ],
 )
+@pytest.mark.parametrize("device_type", ["cpu", "meta", "cuda"])
+@pytest.mark.parametrize("kvp_size", [1, 2])
 def test_indexer_projection_plan_preserves_execution_boundaries(
-    mode, layer, total, history, head_group, expected
+    mode, layer, total, history, head_group, expected, device_type, kvp_size
 ):
     backend = _backend("cpu", 2)
     backend.spec = replace(
         backend.spec, indexer_query_rank=3, indexer_query_group=tuple(range(8))
     )
     # The planner uses host metadata only; no CUDA runtime is needed here.
-    positions = SimpleNamespace(is_cuda=True, numel=lambda: total)
+    backend.kvp_size = kvp_size
+    positions = (
+        SimpleNamespace(device=torch.device("cuda"), numel=lambda: total)
+        if device_type == "cuda"
+        else torch.empty(total, device=device_type)
+    )
+    expected = expected and device_type == "cuda"
     spans = (SimpleNamespace(prefix=history * 2 - total, count=total),)
     with patch.object(backend, "_window", return_value=(None, spans)):
         plan = backend.plan_indexer_queries(layer, positions, None, mode, head_group)

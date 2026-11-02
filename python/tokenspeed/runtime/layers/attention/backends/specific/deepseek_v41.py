@@ -49,6 +49,7 @@ from typing import NamedTuple
 
 import torch
 from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import normalize_dcp_partials
+from tokenspeed_kernel.platform import on_accelerator
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.distributed.comm_ops import all_gather
@@ -1096,7 +1097,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         # Read before any writes: a scheduler-reused tail page must not destroy
         # the odd-prefix input needed by the first completed pair in this chunk.
         tail = self.cache_pool.compressor_tail(owner)
-        if content.device.type != "cpu":
+        if on_accelerator(content):
             from tokenspeed_kernel.ops.attention import dsv41
 
             pooled = dsv41.compressor_pool(
@@ -1130,13 +1131,13 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 pooled[start:stop] = (
                     weights[:, 0] * prior_content + weights[:, 1] * content[start:stop]
                 ).masked_fill(~active[start:stop, None], 0)
-        if content.device.type == "cpu" and norm_weight is not None:
+        if not on_accelerator(content) and norm_weight is not None:
             normalized = pooled.to(torch.bfloat16).float()
             normalized = normalized * torch.rsqrt(
                 normalized.square().mean(-1, keepdim=True) + norm_eps
             )
             pooled = (normalized * norm_weight.float()).to(torch.bfloat16)
-        if content.device.type != "cpu":
+        if on_accelerator(content):
             dsv41.compressor_tail_scatter(content, scores, tail, write_slots)
         else:
             live = write_slots >= 0
@@ -1252,9 +1253,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         if (
             forward_mode.is_mixed()
             or not forward_mode.is_extend()
-            or (not positions.is_cuda and positions.device.type != "npu")
+            or not on_accelerator(positions)
             or index_process_group is not None
-            or (not positions.is_cuda and self.kvp_size != 1)
             or owner < 0
             or source != owner
             or layer_id != source
