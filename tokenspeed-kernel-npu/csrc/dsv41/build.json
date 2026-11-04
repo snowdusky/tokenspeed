@@ -68,5 +68,13 @@
   {
     "source": "host_mxfp8.asc",
     "output": "python/tokenspeed_kernel_npu/ops/libgather_fp8_fused.so"
+  },
+  {
+    "source": "router_topk.asc",
+    "output": "python/tokenspeed_kernel_npu/ops/_v41/librouter_topk.so"
+  },
+  {
+    "source": "swiglu_route_native.asc",
+    "output": "python/tokenspeed_kernel_npu/ops/_v41/libswiglu_route.so"
   }
 ]

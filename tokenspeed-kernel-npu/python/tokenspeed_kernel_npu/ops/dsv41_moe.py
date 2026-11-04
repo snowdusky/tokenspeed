@@ -71,6 +71,50 @@ def _weighted_swiglu_active(
 
 
 @triton.jit
+def _swiglu_with_route_weights(
+    X,
+    Map,
+    Topk,
+    Counts,
+    Y,
+    N,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    E: tl.constexpr,
+    W0,
+    W1,
+    LIMIT: tl.constexpr,
+    CORES: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """SwiGLU that reads the route weight straight from the router output.
+
+    Folding ``_scatter_route_weights`` into this kernel drops one launch and the
+    per-route weight buffer: route ``i`` writes expanded row ``Map[i]`` with
+    ``topk_weights[i // K, i % K]``, so the weight is available here.
+    """
+    experts = tl.arange(0, triton.next_power_of_2(E))
+    valid = tl.sum(tl.load(Counts + experts, experts < E, other=0).to(tl.int32), 0)
+    valid = tl.minimum(valid, N)
+    col = tl.arange(0, BLOCK)
+    for i in range(tl.program_id(0), N, CORES):
+        dst = tl.load(Map + i, i < N, other=-1)
+        live = (dst >= 0) & (dst < valid) & (i < N)
+        w = tl.load(Topk + (i // K) * W0 + (i % K) * W1, i < N, other=0).to(tl.float32)
+        gate = tl.load(
+            X + dst.to(tl.int64) * 2 * H + col, live & (col < H), other=0
+        ).to(tl.float32)
+        up = tl.load(
+            X + dst.to(tl.int64) * 2 * H + H + col, live & (col < H), other=0
+        ).to(tl.float32)
+        if LIMIT > 0:
+            gate = tl.minimum(gate, LIMIT)
+            up = tl.minimum(tl.maximum(up, -LIMIT), LIMIT)
+        result = ((gate / (1.0 + tl.exp(-gate))) * up) * w
+        tl.store(Y + dst.to(tl.int64) * H + col, result, live & (col < H))
+
+
+@triton.jit
 def _combine(
     Expanded,
     Map,

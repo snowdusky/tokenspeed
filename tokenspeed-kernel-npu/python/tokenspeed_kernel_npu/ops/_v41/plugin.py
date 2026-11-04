@@ -32,6 +32,7 @@ def register():
         v41_dspark_plugin,
         v41_index_plugin,
         v41_mhc_plugin,
+        v41_moe_plugin,
     )
 
     for provider in (
@@ -39,5 +40,6 @@ def register():
         v41_index_plugin,
         v41_mhc_plugin,
         v41_dspark_plugin,
+        v41_moe_plugin,
     ):
         provider.register()

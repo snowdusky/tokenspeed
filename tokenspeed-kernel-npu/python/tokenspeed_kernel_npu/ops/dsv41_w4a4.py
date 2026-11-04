@@ -29,9 +29,10 @@ import functools
 import torch
 import torch_npu
 from tokenspeed_kernel_npu._triton import tl, triton
+from tokenspeed_kernel_npu.ops._v41.swiglu_route_native import swiglu_route_native
 from tokenspeed_kernel_npu.ops.dsv41_moe import (
     _combine,
-    _scatter_route_weights,
+    _swiglu_with_route_weights,
     _weighted_swiglu_active,
 )
 from tokenspeed_kernel_npu.ops.dsv41_w4a4_native import grouped_w4a4
@@ -129,9 +130,11 @@ def expert_slot_tensors(*, w, plan) -> list[torch.Tensor]:
     ]
 
 
-def grouped_experts(x, route_weights, counts, *, w, plan):
+def grouped_experts(x, route_weights, counts, *, route_mapping, w, plan):
     """Apply clipped SwiGLU and FP32 route weights before Down projection.
 
+    With route_mapping, weights stay in router order and SwiGLU gathers them
+    directly; otherwise weights are already in expanded expert order.
     Counts remain on device. Static graph capacity may exceed their sum; no
     transform, activation or GEMM reads the inactive tail as a real row.
     """
@@ -172,21 +175,44 @@ def grouped_experts(x, route_weights, counts, *, w, plan):
     hidden = torch.empty(
         (x.shape[0], w.intermediate_size), device=x.device, dtype=x.dtype
     )
-    _weighted_swiglu_active[(48,)](
-        gate_up,
-        route_weights,
-        counts,
-        hidden,
-        w.intermediate_size,
-        w.num_local_experts,
-        x.shape[0],
-        float(w.swiglu_arg.limit),
-        48,
-        triton.next_power_of_2(w.intermediate_size),
-        num_warps=1,
-        multibuffer=False,
-        enable_fp_fusion=False,
-    )
+    if route_mapping is None:
+        _weighted_swiglu_active[(48,)](
+            gate_up,
+            route_weights,
+            counts,
+            hidden,
+            w.intermediate_size,
+            w.num_local_experts,
+            x.shape[0],
+            float(w.swiglu_arg.limit),
+            48,
+            triton.next_power_of_2(w.intermediate_size),
+            num_warps=1,
+            multibuffer=False,
+            enable_fp_fusion=False,
+        )
+    elif not swiglu_route_native(
+        gate_up, route_mapping, route_weights, counts, hidden, float(w.swiglu_arg.limit)
+    ):
+        _swiglu_with_route_weights[(48,)](
+            gate_up,
+            route_mapping,
+            route_weights,
+            counts,
+            hidden,
+            route_mapping.numel(),
+            w.intermediate_size,
+            route_weights.shape[1],
+            w.num_local_experts,
+            route_weights.stride(0),
+            route_weights.stride(1),
+            float(w.swiglu_arg.limit),
+            48,
+            triton.next_power_of_2(w.intermediate_size),
+            num_warps=1,
+            multibuffer=False,
+            enable_fp_fusion=False,
+        )
     del gate_up
     packed, token_scale = quantize(hidden, weights.second)
     del hidden
@@ -228,21 +254,9 @@ def moe_apply(
         row_idx_type=0,
         drop_pad_mode=0,
     )
-    weights = torch.empty(capacity, dtype=torch.float32, device=x.device)
-    _scatter_route_weights[(triton.cdiv(capacity, 256),)](
-        mapping,
-        topk_weights,
-        weights,
-        capacity,
-        ids.shape[1],
-        topk_weights.stride(0),
-        topk_weights.stride(1),
-        256,
-        num_warps=1,
-        multibuffer=False,
-        enable_fp_fusion=False,
+    expanded_out = grouped_experts(
+        expanded, topk_weights, counts, route_mapping=mapping, w=w, plan=plan
     )
-    expanded_out = grouped_experts(expanded, weights, counts, w=w, plan=plan)
     out = torch.empty_like(x)
     _combine[(x.shape[0], triton.cdiv(x.shape[1], 4096))](
         expanded_out,

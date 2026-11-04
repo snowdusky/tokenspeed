@@ -326,6 +326,7 @@ def test_w4a4_experts_and_graph(group, mixed, max_rows, experts, top_k, routing)
             counts.to("npu"),
             w=layer,
             plan=layer.plan,
+            route_mapping=None,
         )
         token_order = torch.empty_like(reference)
         token_order[order] = reference

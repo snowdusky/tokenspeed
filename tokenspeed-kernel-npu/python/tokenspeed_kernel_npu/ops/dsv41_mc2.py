@@ -313,5 +313,5 @@ def moe_apply(
         topk_weights,
         max_rows=max_num_tokens_per_gpu,
     )
-    output = grouped_experts(rows, weights, counts, w=w, plan=plan)
+    output = grouped_experts(rows, weights, counts, route_mapping=None, w=w, plan=plan)
     return transport.combine(output, handle)
