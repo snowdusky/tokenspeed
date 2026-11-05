@@ -59,8 +59,16 @@ class ExpertLoadRowMask:
 
     def __init__(self, mapping: Mapping) -> None:
         self._mapping = mapping
+        self._all_to_all_ep = False
         # [max_rows] bool on the placement's device; None until reserved.
         self.mask: torch.Tensor | None = None
+
+    @classmethod
+    def for_all_to_all(cls, mapping: Mapping) -> ExpertLoadRowMask:
+        """Count this rank's dispatched rows instead of the gathered MoE input."""
+        rows = cls(mapping)
+        rows._all_to_all_ep = True
+        return rows
 
     @property
     def max_rows(self) -> int:
@@ -114,6 +122,12 @@ class ExpertLoadRowMask:
             padded_global_num_tokens=padded_global_num_tokens,
             live_global_num_tokens=live_global_num_tokens,
         )
+        if self._all_to_all_ep and len(segments) > 1:
+            # All-to-all dispatch routes this rank's shard, not the gathered
+            # rows of its peers. An idle rank must count no padded routes.
+            segments = [
+                segments[self._mapping.moe.tp_ep_group.index(self._mapping.rank)]
+            ]
         total = sum(rows for rows, _ in segments)
         mask = self.rows(total)
         if all(live == rows for rows, live in segments):

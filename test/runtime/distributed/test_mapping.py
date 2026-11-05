@@ -511,6 +511,35 @@ class TestLmHeadMapping:
         assert m.lm_head.dp_size == 2
         assert m.lm_head.dp_group == (1, 5)
 
+    @pytest.mark.parametrize("tp", [2, 4, 8])
+    def test_explicit_head_within_attention_dp_group(self, tp):
+        for rank in range(16):
+            m = Mapping(
+                rank=rank,
+                world_size=16,
+                attn_tp_size=tp,
+                attn_dp_size=16 // tp,
+                lm_head_tp_size=tp,
+            )
+            assert m.lm_head.tp_group == m.attn.tp_group
+            assert m.lm_head.tp_rank == m.attn.tp_rank
+            assert not m.lm_head_crosses_attention_dp
+            assert not m.lm_head_skip_all_gather
+
+    @pytest.mark.parametrize("tp", [1, 2, 4, 8])
+    def test_default_dp_head_still_keeps_local_logits(self, tp):
+        m = Mapping(rank=0, world_size=16, attn_tp_size=tp, attn_dp_size=16 // tp)
+        assert m.lm_head.tp_size == 1
+        assert not m.lm_head_crosses_attention_dp
+        assert m.lm_head_skip_all_gather
+
+    def test_cross_dp_head_keeps_existing_row_gather_contract(self):
+        m = Mapping(
+            rank=0, world_size=8, attn_tp_size=1, attn_dp_size=8, lm_head_tp_size=4
+        )
+        assert m.lm_head_crosses_attention_dp
+        assert m.lm_head_skip_all_gather
+
     def test_shares_the_head_group_tuple(self):
         """The decode preset reuses one node-local group for heads, dense and
         the LM head; identical tuples dedupe in the process-group manager."""

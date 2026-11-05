@@ -388,3 +388,6 @@ def triton_apply_stop_conditions(
         NUM_STOP_IDS=stop_token_ids.shape[1],
         num_warps=4,
     )
+
+
+import tokenspeed_kernel.ops.metadata.ascend  # noqa: E402,F401

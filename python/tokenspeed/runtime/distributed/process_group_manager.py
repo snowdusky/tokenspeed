@@ -172,6 +172,7 @@ class ProcessGroupManager:
         backend: str | list[str] | None = None,
         *,
         name: str | None = None,
+        pg_options=None,
     ) -> None:
         """Create the process groups over ``group``'s ranks, once per backend.
 
@@ -206,7 +207,9 @@ class ProcessGroupManager:
                 )
                 continue
             for g in _make_all_groups(group):
-                pg = dist.new_group(g, backend=backend, timeout=self._pg_timeout)
+                pg = dist.new_group(
+                    g, backend=backend, timeout=self._pg_timeout, pg_options=pg_options
+                )
                 if g == group:
                     self.register_process_group(backend, g, pg, name=name)
 

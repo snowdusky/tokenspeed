@@ -4,6 +4,12 @@ TokenSpeed-Kernel-NPU contains the Ascend-specific operators used by
 TokenSpeed. Keeping these implementations in a standalone package mirrors the
 AMD package layout and keeps the TokenSpeed runtime vendor-neutral.
 
+NPU platform initialization supplies missing `torch.distributed` names on the
+Torch 2.9 stack: `all_gather_single` aliases `all_gather_into_tensor`, and
+`reduce_scatter_single` aliases `reduce_scatter_tensor`. Existing implementations
+are preserved. These process-wide aliases retain arguments and asynchronous
+Work handles; they do not depend on loading a particular model or attention op.
+
 The initial Ascend path provides paged MHA, RMSNorm, Q/K RMSNorm, rotary
 embedding, and the Triton-Ascend import adapter required by CANN 9.0.0.
 
@@ -17,6 +23,15 @@ The validated stack is CANN 9.0.0, PyTorch 2.9.0, `torch_npu` 2.9.0.post2,
 Transformers 5.12.0, Triton 3.2.0, and Triton-Ascend 3.2.1. The setup script
 records every Python package mutation needed by this Ascend path, including the
 `apache-tvm-ffi==0.1.13` build dependency and editable install of this package.
+
+MXFP8 embedding lookup accepts strided two-dimensional indices directly,
+including per-layer Engram hash slices, without copying them to a contiguous buffer.
+
+The V4.1 MC2 transport carries route IDs and FP32 weight bits beside BF16
+activations. Packing uses wide feature tiles; unpacking copies several rows per
+tile while reading the active expert counts on the device. Eager execution and
+graph replay use the same kernels, including zero-weight padding and idle ranks.
+The transport preserves the order and precision of expert contributions.
 
 TokenSpeed applications should continue to import operators from
 `tokenspeed-kernel`; it owns registration and dispatch to this package.

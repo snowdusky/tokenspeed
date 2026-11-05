@@ -52,6 +52,7 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel.ops.attention.dsv41._inputs import IndexKeyInput, IndexQueryInput
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import bounded_group_slots
+from tokenspeed_kernel.platform import on_accelerator
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -59,35 +60,35 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 __all__ = [
     "IndexKeyInput",
     "IndexQueryInput",
+    "cache_gather",
+    "cache_pack",
+    "cache_scatter",
+    "cache_unpack",
+    "compact_slots",
+    "compressor_metadata",
+    "compressor_pool",
+    "compressor_tail_scatter",
     "decode_rows",
     "decode_window",
+    "dspark_anchors",
+    "dspark_block",
+    "dspark_rows",
+    "dspark_rows_supported",
+    "global_rope_scatter",
     "global_slots",
-    "compact_slots",
-    "selection_table",
-    "cache_pack",
-    "cache_unpack",
-    "cache_scatter",
-    "cache_gather",
-    "index_q_quantize",
+    "index_candidates",
     "index_key_norm_rope",
     "index_key_norm_rope_scatter",
-    "index_query_rope_weights",
+    "index_q_quantize",
     "index_query_rope_quant",
-    "selected_attention",
-    "selected_attention_rope",
-    "new_attention_schedule",
+    "index_query_rope_weights",
     "index_score",
-    "index_topk",
-    "new_index_metadata",
     "index_select_all",
+    "index_topk",
     "local_index_supported",
-    "index_candidates",
     "merge_index_candidates",
-    "compressor_tail_scatter",
-    "compressor_pool",
-    "compressor_metadata",
-    "swa_rope_scatter",
-    "global_rope_scatter",
+    "new_attention_schedule",
+    "new_index_metadata",
     "rope_inplace",
     "rope_weights_inplace",
     "rope_pad_query",
@@ -95,6 +96,10 @@ __all__ = [
     "dspark_anchors",
     "dspark_block",
     "dspark_workspace",
+    "selected_attention",
+    "selected_attention_rope",
+    "selection_table",
+    "swa_rope_scatter",
 ]
 
 
@@ -750,8 +755,10 @@ def _validate_rope(values, positions, cos_sin_cache):
         raise ValueError(
             "V4.1 RoPE values must be BF16/FP16 [tokens,dim] or [tokens,heads,dim]"
         )
-    if not values.is_cuda or values.stride(-1) != 1:
-        raise ValueError("V4.1 RoPE requires CUDA values with contiguous head channels")
+    if not on_accelerator(values) or values.stride(-1) != 1:
+        raise ValueError(
+            "V4.1 RoPE requires device values with contiguous head channels"
+        )
     if positions.shape != values.shape[:1] or positions.dtype not in (
         torch.int32,
         torch.int64,
@@ -907,6 +914,22 @@ def rope_pad_query(
     return kernel(values, positions, cos_sin_cache)
 
 
+def dspark_rows_supported(values: torch.Tensor) -> bool:
+    """Whether BF16 [...,512] rows can use the registered DSpark device kernels."""
+    if (
+        not on_accelerator(values)
+        or values.ndim not in (2, 3)
+        or values.dtype != torch.bfloat16
+        or values.shape[-1] != 512
+    ):
+        return False
+    try:
+        _kernel("dspark_rows", values)
+    except NoKernelFoundError:
+        return False
+    return True
+
+
 def dspark_rows(
     values: torch.Tensor,
     norm_weight: torch.Tensor | None,
@@ -1023,7 +1046,7 @@ def dspark_anchors(
     for tensor in (output_tokens, accept_lengths, positions, start_pos):
         if tensor.dtype not in (torch.int32, torch.int64) or not tensor.is_contiguous():
             raise ValueError("DSpark anchor inputs must be contiguous integers")
-    if not positions.is_cuda:
+    if positions.device.type == "cpu":
         rows = torch.arange(num_decodes)
         accepted = accept_lengths[num_extends:].to(torch.int64).clamp(1, width)
         verify = num_prefill_outputs + rows * width + accepted - 1
@@ -1079,7 +1102,7 @@ def dspark_block(
             raise ValueError("DSpark block inputs must be int32/int64")
     if history_slots.stride(1) != 1:
         raise ValueError("DSpark history slots need a unit column stride")
-    if not bonus.is_cuda:
+    if bonus.device.type == "cpu":
         n, window = history_slots.shape
         device = bonus.device
         ids = torch.full((n, block_size), noise_token, dtype=torch.int32, device=device)
@@ -1149,7 +1172,7 @@ def decode_rows(
         raise ValueError("decode row vectors must be contiguous")
     if any(tensor.device != positions.device for tensor in tensors):
         raise ValueError("decode row vectors must share a device")
-    if not positions.is_cuda:
+    if positions.device.type == "cpu":
         lengths.zero_()
         lengths[:actual_bs].copy_(seq_lens[:actual_bs].clamp_min(width))
         positions.view(bs, width).copy_(
@@ -1194,7 +1217,7 @@ def decode_window(
     history is resident is the scheduler's retention contract, not checked
     here. Returns None.
     """
-    if not positions.is_cuda:
+    if positions.device.type == "cpu":
         from tokenspeed_kernel.ops.attention.mla._triton.page_table import (
             bounded_group_slots,
         )
@@ -1227,7 +1250,7 @@ def global_slots(rows, positions, requests, table, ratio, pages):
     Query coordinates [N] determine causality, ratio is raw tokens per global
     row, and pages bounds the LCM field. Invalid/null addresses resolve to -1.
     """
-    if not positions.is_cuda:
+    if positions.device.type == "cpu":
         from tokenspeed_kernel.ops.attention.mla._triton.page_table import (
             bounded_group_slots,
         )
@@ -1250,7 +1273,7 @@ def selection_table(positions, requests, table, ratio):
     Returns int32 table[N,table_width] with null/invalid request entries -1,
     and int32 visible lengths[N]. ratio is raw tokens per global cache row.
     """
-    if not positions.is_cuda:
+    if positions.device.type == "cpu":
         out = torch.full((positions.numel(), table.shape[1]), -1, dtype=torch.int32)
         if table.numel():
             values = table[requests.clamp(0, table.shape[0] - 1)]
@@ -1292,7 +1315,7 @@ def compressor_metadata(
     in place, including padding, so callers can reuse storage under CUDA graphs.
     Returns None. Inputs and destinations must not alias.
     """
-    if not positions.is_cuda:
+    if positions.device.type == "cpu":
         active.copy_((positions >= 0) & (positions % 2 == 1))
         pair_positions.copy_((positions - 1).masked_fill(~active, -1))
         pair_requests.copy_(requests.masked_fill(~active, -1))
@@ -1370,12 +1393,13 @@ def merge_index_candidates(packed, rows, lengths):
 
 # Backend registration (side-effect imports)
 # isort: off
-import tokenspeed_kernel.ops.attention.dsv41.triton  # noqa: E402,F401
-import tokenspeed_kernel.ops.attention.dsv41._triton.rope  # noqa: E402,F401
-import tokenspeed_kernel.ops.attention.dsv41.gluon  # noqa: E402,F401
-import tokenspeed_kernel.ops.attention.dsv41.deep_select  # noqa: E402,F401
-import tokenspeed_kernel.ops.attention.dsv41.deep_gemm  # noqa: E402,F401
-import tokenspeed_kernel.ops.attention.dsv41.flash_mla  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.dsv41.ascend
+import tokenspeed_kernel.ops.attention.dsv41.triton
+import tokenspeed_kernel.ops.attention.dsv41._triton.rope
+import tokenspeed_kernel.ops.attention.dsv41.gluon
+import tokenspeed_kernel.ops.attention.dsv41.deep_select
+import tokenspeed_kernel.ops.attention.dsv41.deep_gemm
+import tokenspeed_kernel.ops.attention.dsv41.flash_mla  # noqa: F401
 
 # isort: on
 
@@ -1425,7 +1449,7 @@ def index_select_all(page_table, visible_lens, pages, candidate_block_size, out)
             raise ValueError(
                 "All-history outputs must be contiguous int32 destinations"
             )
-    if page_table.is_cuda:
+    if on_accelerator(page_table):
         return _kernel("index_select_all", page_table)(
             page_table, visible_lens, pages, candidate_block_size, out
         )
@@ -1478,7 +1502,7 @@ def compact_slots(slots: torch.Tensor, lengths: torch.Tensor):
         or slots.device != lengths.device
     ):
         raise ValueError("Expected integer slots [N,K] and lengths [N] on one device")
-    if not slots.is_cuda:
+    if slots.device.type == "cpu":
         columns = torch.arange(slots.shape[1], device=slots.device)
         valid = (slots >= 0) & (columns[None, :] < lengths[:, None])
         order = torch.where(valid, columns, columns + slots.shape[1]).argsort(dim=-1)

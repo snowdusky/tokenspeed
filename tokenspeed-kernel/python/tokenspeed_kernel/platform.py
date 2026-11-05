@@ -43,9 +43,19 @@ __all__ = [
     "CapabilityRequirement",
     "Platform",
     "current_platform",
+    "on_accelerator",
     "max_active_ctas",
     "prepare_cuda_toolkit_env",
 ]
+
+
+def on_accelerator(value: torch.Tensor | torch.device) -> bool:
+    """Return whether a tensor or device is outside CPU and abstract meta storage.
+
+    This classifies the device only; kernel support is selected separately.
+    """
+    device = value if isinstance(value, torch.device) else value.device
+    return device.type not in {"cpu", "meta"}
 
 
 def prepare_cuda_toolkit_env() -> None:
@@ -469,6 +479,9 @@ def _detect_platform() -> PlatformInfo:
 
 def _detect_npu_platform() -> PlatformInfo:
     """Detect an Ascend platform exposed through torch-npu."""
+    from tokenspeed_kernel_npu import register_torch_compat
+
+    register_torch_compat()
     props = torch.npu.get_device_properties(torch.npu.current_device())
     return PlatformInfo(
         vendor="ascend",

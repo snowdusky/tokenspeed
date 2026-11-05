@@ -35,7 +35,7 @@ from tokenspeed_kernel.ops.attention.dsv41.triton import (
     _same_device,
     _ue8m0_word,
 )
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import CapabilityRequirement, on_accelerator
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
@@ -115,9 +115,9 @@ def _validate_index_key_inputs(values, weight, positions, cos_sin_cache, eps):
         values.ndim != 2
         or values.shape[1] != 128
         or values.dtype != torch.bfloat16
-        or not values.is_cuda
+        or not on_accelerator(values)
     ):
-        raise ValueError("Index keys must be GPU BF16 [tokens, 128]")
+        raise ValueError("Index keys must be device BF16 [tokens, 128]")
     if (
         weight.shape != (128,)
         or weight.dtype != torch.bfloat16
@@ -246,10 +246,10 @@ def _validate_index_query_inputs(query, head_weights, positions, cos_sin_cache):
         query.ndim != 3
         or query.shape[2] != 128
         or query.dtype != torch.bfloat16
-        or not query.is_cuda
+        or not on_accelerator(query)
         or query.shape[1] < 1
     ):
-        raise ValueError("Index queries must be GPU BF16 [tokens, heads, 128]")
+        raise ValueError("Index queries must be device BF16 [tokens, heads, 128]")
     if head_weights.shape != query.shape[:2] or head_weights.dtype != torch.bfloat16:
         raise ValueError("Index head weights must be BF16 [tokens, heads]")
     if positions.shape != query.shape[:1] or positions.dtype not in (

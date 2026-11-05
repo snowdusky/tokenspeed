@@ -579,6 +579,7 @@ class ServerArgs:
     deepseek_v4_indexer_prefill_max_logits_mb: int = 512
     deepseek_v4_prefill_chunk_size: int = 4
     # DeepSeek V4.1 Engram host tables. Off by default (GPU-sharded).
+    engram_tp_size: int | None = None
     engram_host_table: bool = False
     engram_host_table_dir: str | None = None
     engram_host_table_layout: str = "auto"
@@ -2340,8 +2341,7 @@ class ServerArgs:
             nargs="?",
             metavar="model",
             default=None,
-            help="The model name or path (positional argument). "
-            "Equivalent to --model.",
+            help="The model name or path (positional argument). Equivalent to --model.",
         )
         parser.add_argument(
             "--model",
@@ -3015,10 +3015,18 @@ class ServerArgs:
             metavar="ALL2ALL_BACKEND",
             type=str,
             default=ServerArgs.all2all_backend,
-            choices=["none", "agrs", "deepep", "flashinfer", "gluon_petit"],
+            choices=[
+                "none",
+                "agrs",
+                "deepep",
+                "flashinfer",
+                "gluon_petit",
+                "ascend_mc2",
+            ],
             help="MoE communication backend. agrs and flashinfer explicitly select "
             "the Kimi-K3 attention-DP transport; gluon_petit selects the fused "
-            "Petit MegaMoE transport; none preserves existing behavior.",
+            "Petit MegaMoE transport; ascend_mc2 selects Ascend hierarchy "
+            "Dispatch/Combine; none preserves existing behavior.",
         )
         parser.add_argument(
             "--deepep-mode",
@@ -3223,9 +3231,13 @@ class ServerArgs:
             "--deepseek-v4-prefill-chunk-size",
             type=int,
             default=ServerArgs.deepseek_v4_prefill_chunk_size,
-            help=(
-                "Maximum number of requests per DeepSeek V4 FlashMLA prefill " "chunk."
-            ),
+            help=("Maximum number of requests per DeepSeek V4 FlashMLA prefill chunk."),
+        )
+        parser.add_argument(
+            "--engram-tp-size",
+            type=int,
+            default=ServerArgs.engram_tp_size,
+            help="Ascend V4.1 device table TP: attention TP by default, or the full world.",
         )
         parser.add_argument(
             "--engram-host-table",

@@ -23,3 +23,10 @@ license-files = ["LICENSE", "THIRDPARTYNOTICES"]
 
 [tool.setuptools.packages.find]
 where = ["python"]
+
+[project.entry-points."tokenspeed_kernel.plugins"]
+v41_ascend = "tokenspeed_kernel_npu.ops._v41.plugin:register"
+
+[tool.setuptools.package-data]
+"tokenspeed_kernel_npu.ops" = ["*.so"]
+"tokenspeed_kernel_npu.ops._v41" = ["*.so"]

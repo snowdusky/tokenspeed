@@ -3877,6 +3877,7 @@ def kimi3_router_projection(
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.numerics.torch.gemm  # noqa: E402,F401
+import tokenspeed_kernel.ops.gemm.ascend  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.deepgemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.cute_dsl  # noqa: E402,F401
@@ -4067,7 +4068,7 @@ def fp32_router_gemv_execute(
         or not x.is_contiguous()
     ):
         raise ValueError(
-            "router input must be contiguous FP32 " f"[rows, {typed_plan.hidden_size}]"
+            f"router input must be contiguous FP32 [rows, {typed_plan.hidden_size}]"
         )
     return typed_plan.kernel(
         x,

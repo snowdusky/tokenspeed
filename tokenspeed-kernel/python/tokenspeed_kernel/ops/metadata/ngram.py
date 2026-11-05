@@ -362,6 +362,28 @@ def prepare_ngram_inputs(
     ``total`` are dead padding. Uniform positive request length selects direct
     indexing; zero selects ragged indexing. All modes use this same operation.
     """
+    if ids.device.type == "npu":
+        from tokenspeed_kernel_npu.ops.ngram import prepare_ngram_inputs as npu_prepare
+
+        return npu_prepare(
+            snapshots,
+            positions,
+            reset,
+            slots,
+            cache_lengths,
+            request_ends,
+            tail,
+            needs_seed,
+            ids,
+            previous,
+            token_mask,
+            prefix,
+            hashes,
+            total,
+            vocab_size,
+            uniform_length,
+            hash_params,
+        )
     bs = slots.numel()
     if not ids.is_cuda:
         seed = reset.bool() | needs_seed[slots]
@@ -525,6 +547,23 @@ def commit_ngram_inputs(
     must remain alive through commit, including after embedding IDs are clamped.
     """
     bs = slots.numel()
+    if ids.device.type == "npu":
+        from tokenspeed_kernel_npu.ops.ngram import commit_ngram_inputs as npu_commit
+
+        return npu_commit(
+            slots,
+            lengths,
+            accepted,
+            ids,
+            previous,
+            token_mask,
+            prefix,
+            tail,
+            needs_seed,
+            cache_lengths,
+            num_extends,
+            padding_slot,
+        )
     if not ids.is_cuda:
         rows = torch.arange(bs, device=slots.device)
         delta = torch.where(rows < num_extends, lengths, accepted)

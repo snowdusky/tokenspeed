@@ -458,7 +458,10 @@ def test_gate_matches_reference_and_mask_is_identity():
     expected = (h + gate.unsqueeze(-1) * value.unsqueeze(-2)).to(hidden.dtype)
     torch.testing.assert_close(model(hidden, ids, mask), expected, rtol=0, atol=0)
     torch.testing.assert_close(
-        model(hidden, ids, mask)[~mask], hidden[~mask], rtol=0, atol=0
+        model(hidden, ids, mask)[~mask],
+        hidden[~mask],
+        rtol=0,
+        atol=0,
     )
     # Signed sqrt clamps zero to +sqrt(1e-6), rather than using sign(0) == 0.
     model.q_weight.data.zero_()
@@ -466,7 +469,10 @@ def test_gate_matches_reference_and_mask_is_identity():
         hidden.dtype
     )
     torch.testing.assert_close(
-        model(hidden, ids, torch.ones_like(mask)), expected, rtol=0, atol=0
+        model(hidden, ids, torch.ones_like(mask)),
+        expected,
+        rtol=0,
+        atol=0,
     )
 
 
@@ -476,7 +482,7 @@ def test_quantized_projection_loader_aliases_and_real_table_metadata(
     monkeypatch, config_class, hopper
 ):
     monkeypatch.setattr(
-        v41, "current_platform", lambda: SimpleNamespace(is_hopper=hopper)
+        v41, "current_platform", lambda: SimpleNamespace(is_hopper=hopper, is_npu=False)
     )
     quant = config_class.from_config(
         {

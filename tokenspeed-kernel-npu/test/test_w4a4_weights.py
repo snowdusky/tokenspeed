@@ -126,7 +126,7 @@ def test_prepare_preserves_layout_scales_and_matrix_orientation(
     )
     s13, s2 = torch.rand(e, 2 * i) + 0.1, torch.rand(e, h) + 0.1
     plan = prepare_w4a4_moe_weights(
-        w13, w2, s13, s2, first, second, transposed=transposed
+        w13, w2, s13, s2, first, second, transposed=transposed, native_packed_nz=False
     )
     assert calls == [29, 29]
     result13, result2 = unpack_int4(plan.w13), unpack_int4(plan.w2)
@@ -186,6 +186,7 @@ def test_real_nz_weights_match_integer_gmm(transposed, h, i, activation_range):
         stage(h),
         stage(i),
         transposed=transposed,
+        native_packed_nz=False,
     )
     # Official GMM is a test oracle only, never a production fallback.
     for nz, weight, scale in (

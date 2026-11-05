@@ -374,7 +374,10 @@ def test_eplb_placement_balances_a_skewed_load():
     assert placement.rank_dispatch_map().shape == (layers, experts)
 
 
-def test_build_expert_placement_refuses_models_that_do_not_opt_in():
+@pytest.mark.parametrize(
+    "backend", ["none", "agrs", "deepep", "flashinfer", "gluon_petit", "ascend_mc2"]
+)
+def test_build_expert_placement_refuses_models_that_do_not_opt_in(backend):
     from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 
     class Plain(BaseCausalLM):
@@ -395,7 +398,10 @@ def test_build_expert_placement_refuses_models_that_do_not_opt_in():
         expert_distribution_recorder_mode="stat",
         ep_dispatch_algorithm="static",
         enable_eplb=False,
-        mapping=_mapping(),
+        all2all_backend=backend,
+        mapping=Mapping(
+            rank=1, world_size=2, attn_tp_size=1, attn_dp_size=2, moe_ep_size=2
+        ),
     )
     model_config = SimpleNamespace(hf_config=None)
     assert not BaseCausalLM.supports_expert_placement
@@ -411,12 +417,20 @@ def test_build_expert_placement_refuses_models_that_do_not_opt_in():
         mock.patch.object(
             expert_location,
             "compute_initial_expert_location_metadata",
-            return_value=_placement(0),
+            return_value=_placement(1),
         ),
     ):
         placement = build_expert_placement(args, model_config)
     assert placement.physical_load is not None  # stat recording allocated
     assert placement.load_rows is not None  # with its live-row mask
+    placement.reserve_load_rows(8)
+    placement.load_rows.mark_padded(
+        padded_global_num_tokens=[4, 4], live_global_num_tokens=[4, 0]
+    )
+    if backend == "ascend_mc2":
+        assert not placement.load_rows.rows(4).any()
+    else:
+        assert placement.load_rows.rows(8).tolist() == [True] * 4 + [False] * 4
     # Without a request there is no placement, whatever the model.
     args.ep_num_redundant_experts = 0
     args.expert_distribution_recorder_mode = None
@@ -604,3 +618,23 @@ def test_compute_placement_maps_is_host_only_and_init_by_eplb_wraps_it():
     assert seen["ep_size"] == 4 and seen["num_physical_experts"] == 12
     assert placement.ep_rank == 2 and placement.ep_rank_nodes == (0, 0, 0, 0)
     assert torch.equal(placement.physical_to_logical_map, phy2log)
+
+
+@pytest.mark.parametrize("rank", range(4))
+@pytest.mark.parametrize("nodes", [(0, 0, 1, 1), (0, 1, 2, 3)])
+def test_static_dispatch_host_work_ignores_default_device(rank, nodes):
+    replicas = torch.tensor([[[0, 4], [1, 5], [2, 6], [3, 7]]], dtype=torch.int32)
+    arguments = dict(
+        logical_to_all_physical_map=replicas,
+        num_physical_experts=8,
+        ep_rank_nodes=nodes,
+        ep_rank=rank,
+    )
+    expected = expert_location.compute_logical_to_rank_dispatch_physical_map(
+        **arguments
+    )
+    with torch.device("meta"):
+        actual = expert_location.compute_logical_to_rank_dispatch_physical_map(
+            **arguments
+        )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)

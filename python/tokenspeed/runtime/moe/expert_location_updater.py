@@ -59,7 +59,6 @@ import torch.distributed as dist
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.moe.expert_location import (
     ExpertLocationMetadata,
     ModelConfigForExpertLocation,
@@ -256,6 +255,8 @@ class ExpertLocationUpdater:
 
 def _all_to_all_ep(model: torch.nn.Module) -> bool:
     """Whether the model's MoE layers own all-to-all dispatch (uniform over layers)."""
+    from tokenspeed.runtime.layers.moe.expert import MoELayer
+
     flags = {
         module.supports_all_to_all_ep
         for module in model.modules()

@@ -1,0 +1,153 @@
+# DeepSeek V4.1 Flash on Ascend
+
+This recipe uses eight Ascend devices, FlatQuant W4A4 experts, BF16 dense
+layers, packed KV caches, host-resident FP8 Engram tables and DSpark. Select
+TP1/DP8, TP2/DP4 or TP8/DP1 explicitly; all three use EP8.
+
+Model registration selects `deepseek_v41_ascend910.py` for both the target and
+DSpark on Ascend. It shares checkpoint loading and the CED/DSpark forward
+protocols with the common model. Device weight layouts, BF16/INT4 checkpoint
+rules, expert placement and load counters, Engram row exchange and communication
+preparation live in the Ascend components. Routed experts use the same
+`MoELayer` as other models: the model provides its configuration, the kernel
+registry selects weight preparation and execution, and the common MoE layer
+binds MC2's dedicated communicator before weight processing. Complete model
+warmup and decode capture prepare collective geometry. Prefill remains eager
+in this recipe.
+
+DSpark uses one window implementation across platforms and queries the kernel
+family for fused-row support. Engram resolves its table mapping at construction
+and reuses the common gate calculation. Shared attention and hyperconnection
+branches use the device-neutral stream utility.
+
+Indexer query parallelism on Ascend requires replicated KV
+(`--kv-parallel-size 1`); unsupported QCP/KVP combinations fail at startup.
+RoPE tables must be warmed up before graph capture on each accelerator.
+
+The TP8 recipe explicitly selects FP32 accumulation for BF16 reductions and
+AIV transport for reductions and gathers up to 2 MiB. The same policy supports
+aligned, contiguous TP2 and TP4 groups within one node. Larger messages keep
+the same accumulation dtype and use host-driven HCCL. The four
+`TOKENSPEED_HCCL_TP_{REDUCE_DTYPE,REDUCE_ALGORITHM,GATHER_ALGORITHM,AIV_MAX_BYTES}`
+settings are required together. They apply to the configured rank group,
+including Dense and LM-head collectives when those layers share its ranks.
+The V4.1 model prepares this policy through the existing
+`prepare_communication_runtime` hook, before cache profiling and graph capture.
+Other models do not install it. Without these settings, ordinary HCCL behavior
+is unchanged.
+
+The W4A4 path also requires the existing `flash_ops` FlatQuant extension,
+which registers `torch.ops.custom.flat_quant`.
+
+Activate the serving environment and source the CANN environment. Build the
+Ascend C libraries and install the kernel package from this checkout:
+
+```bash
+python tokenspeed-kernel-npu/csrc/dsv41/build.py
+python -m pip install --no-deps --no-build-isolation -e tokenspeed-kernel-npu
+bash examples/deepseek_v41_ascend/serve.sh /path/to/model 8
+python examples/deepseek_v41_ascend/benchmark.py --model /path/to/model \
+  --endpoint 127.0.0.1:9350 --input-len 131072 --output-len 1000 \
+  --dp-size 1 --concurrency 1 8 16 32 --rounds 3 --reuse-prefix \
+  --out /path/to/result.json
+```
+
+Set `--dp-size` to `8 / TP` so requests cover all attention DP ranks. The
+benchmark records streamed token arrivals and reports decode throughput only
+inside the interval when every request is active. End-to-end throughput and
+TTFT are reported separately. Reusing a prefix reduces prefill work; this
+fixed counting workload is not an agentic accuracy benchmark.
+
+The kernel package registers providers through the TokenSpeed plugin entry
+point. No external experiment directory is needed on `PYTHONPATH`. Native
+libraries are built locally; checkpoints, weight conversion, measurements and
+compiled libraries do not belong in the source tree.
+
+Host Engram mappings are prepared before graph capture and must remain alive
+until all graphs using them are destroyed. Attention builds 16-head and
+64-head capacity variants from one source; the model's local head count
+selects the layout, while request counts remain runtime inputs.
+
+DSpark context writes and proposal workspaces use registered Ascend kernels.
+They preserve the reference normalization and RoPE rounding, followed by the
+all-channel FP8 group32 round trip; the window remains BF16. The codec uses
+integer operations instead of requiring native FP8 tensor conversion on 910.
+
+## Expert load balancing
+
+V4.1 FlatQuant W4A4 supports the standard expert placement and online EPLB
+controller. MC2 selects a local-row load mask so idle and padded rows do not
+inflate expert counts; other transports keep their existing recorder layout.
+The common MoE layer binds MC2's dedicated communicator before expert weight
+processing.
+MC2 dispatches the full rank-consistent row capacity once per layer, including
+idle ranks, and combines once after GMM. Size `HCCL_BUFFSIZE` for the largest
+prefill or graph-capture capacity and the physical expert count, including
+redundant slots; the provider does not split batches to fit a smaller window.
+For cross-node MC2, use EP32, EP64 or EP128 with MoE TP1. Start
+with one redundant expert slot per EP rank: `--ep-num-redundant-experts`
+counts extra slots across the entire EP group, not per device. For EP64:
+
+```text
+--moe-backend ascend_v41_w4a4 --all2all-backend ascend_mc2
+--ep-num-redundant-experts 64 --ep-dispatch-algorithm static
+--expert-distribution-recorder-mode stat --enable-eplb
+--eplb-algorithm deepseek --eplb-rebalance-num-iterations 1000
+--eplb-rebalance-layers-per-chunk 1
+```
+
+These flags supplement a multi-node serving configuration; the eight-device
+script above remains an EP8 recipe. Reserve memory for both the extra expert
+slots and migration staging before sizing KV capacity. The existing execution
+gate performs each layer's migration before publishing its new routing map.
+Packed NZ weights and both scale representations move together without
+changing captured tensor addresses. The target owns placement and counters;
+DSpark's draft keeps its own original expert layout.
+
+Compare EPLB on/off at equal EP size, input/output length and offered load.
+Include counter and migration overhead in sustained throughput, and record
+DSpark acceptance rather than assuming it stays constant as EP grows.
+
+## Validated runtime snapshot
+
+This branch includes full-batch MC2, the W4A4 temporary-buffer lifetime fix,
+per-result asynchronous copy-stream completion, and the Ascend activation,
+metadata and DSpark registrations. The MC2 kernel requires the matching
+compact route-encoding implementation; it is not supplied by this Python
+repository or by changing `HCCL_BUFFSIZE`. The tested BF16 tiling-256 object
+has SHA256 `0e02a6811e8e0d3976e67407fdc7f4248657f470c9942b69b26816ac9ecbbffd`.
+
+Recorded validation for this runtime includes 64-rank MC2 transport/graph
+regression at capacities up to 384 rows, 64-rank real W4A4 expert comparison
+against a frozen reference, and 256 output-copy completions with eager and
+graph producers, pending results and different thread device contexts.
+The corresponding tests live under `test/runtime/npu/`. These are device
+checks, not a complete model-accuracy evaluation.
+
+The EP8 recipe uses AllGather/ReduceScatter with `--all2all-backend none`;
+its measured 128K/1000 decode cost must not be attributed to MC2. Compare
+performance at identical topology, Engram placement, input/output lengths,
+per-card concurrency and graph sizes. In particular, an online EPLB result
+requires an actual applied placement and includes migration stalls.
+
+
+## Ascend completion and layout contracts
+
+Output copies use a stream leased to one result. Commit waits for that stream,
+whose queue contains only that result's copies; it does not synchronize a
+producer carrying later collectives. Discarded results retire their leases and
+retain source tensors until a nonblocking completion query allows reuse.
+Pool teardown drains the remaining retired copies.
+
+MC2 routes rank-local rows, so its expert-load mask covers this rank's live
+rows. Gather-based expert execution retains the existing gathered-row mask.
+W4A4's native grouped provider uses direct packed NZ conversion with
+`npu_format_cast(..., customize_dtype=3)` on the supported CANN stack. Callers
+must explicitly select `native_packed_nz`; the native provider requires complete
+512-column output tiles and rejects partial tiles at its launch boundary.
+
+DSpark's step and final resolve both dispatch through the kernel registry.
+Indexer query partitioning applies only to sufficiently large encoder-prefill
+Full sources; decode, mixed batches, CED-tail Reindex and candidate-producing
+layers keep their original execution. Eligible NPU prefills partition the query
+projection as well as scoring.

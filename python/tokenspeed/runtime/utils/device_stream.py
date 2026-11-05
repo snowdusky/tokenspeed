@@ -22,11 +22,12 @@ from contextlib import contextmanager
 from typing import Any
 
 import torch
+from tokenspeed_kernel.platform import on_accelerator
 
 
 def is_current_stream_capturing(device: torch.device) -> bool:
-    """Query capture on the tensor's accelerator; CPU has no graph capture."""
-    if device.type == "cpu":
+    """Query device stream capture; CPU and meta have no accelerator stream."""
+    if not on_accelerator(device):
         return False
     return torch.get_device_module(device).is_current_stream_capturing()
 
